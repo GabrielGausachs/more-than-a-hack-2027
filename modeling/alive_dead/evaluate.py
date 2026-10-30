@@ -14,14 +14,23 @@ import torch
 from .config import ExperimentConfig
 from .dataset import WCSFData, load_wcsf_data
 from .preprocessing import FeatureNormalizer
-from .splits import FoldSplit, Segment, build_fold_split
+from .splits import FoldSplit, Segment, build_fold_split, build_refit_split
 from .tcn import build_model
-from .train import select_device
 
 
 CLASS_NAMES = {0: "DEAD", 1: "ALIVE"}
 THRESHOLD = 0.5
-SEGMENT_IOUS = (0.50, 0.75)
+SEGMENT_IOUS = (0.3, 0.4, 0.5, 0.6, 0.7)
+SEGMENT_IOU_HEADLINE = 0.5
+
+
+def select_device(requested: str) -> torch.device:
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    return device
 
 
 @dataclass(frozen=True)
@@ -144,7 +153,7 @@ def _match_segments(
 def compute_segment_metrics(
     runs: Sequence[PredictionRun], thresholds: Iterable[float] = SEGMENT_IOUS
 ) -> Dict[str, object]:
-    """Compute per-class and macro segment F1 without crossing run boundaries."""
+    """Compute Metrica-style pooled binary segment F1 over temporal IoUs."""
     if not runs:
         raise ValueError("At least one prediction run is required")
     gt_segments = []
@@ -155,33 +164,33 @@ def compute_segment_metrics(
         gt_segments.extend(extract_segments(run.labels, run_id))
         pred_segments.extend(extract_segments(run.predictions, run_id))
 
-    results: Dict[str, object] = {}
+    per_iou: Dict[str, object] = {}
+    f1s = []
     for threshold in thresholds:
-        per_class: Dict[str, object] = {}
-        f1s = []
-        for class_id, name in CLASS_NAMES.items():
-            gt_class = [segment for segment in gt_segments if segment.label == class_id]
-            pred_class = [segment for segment in pred_segments if segment.label == class_id]
-            matched, spurious, missed = _match_segments(gt_class, pred_class, threshold)
-            precision = _safe_ratio(matched, matched + spurious)
-            recall = _safe_ratio(matched, matched + missed)
-            f1 = _safe_ratio(2.0 * precision * recall, precision + recall)
-            per_class[name] = {
-                "precision": precision,
-                "recall": recall,
-                "f1": f1,
-                "n_ground_truth": len(gt_class),
-                "n_predicted": len(pred_class),
-                "n_matched": matched,
-                "n_missed": missed,
-                "n_spurious": spurious,
-            }
-            f1s.append(f1)
-        results[f"{threshold:.2f}"] = {
-            "macro_f1": float(np.mean(f1s)),
-            "per_class": per_class,
+        matched, spurious, missed = _match_segments(
+            gt_segments, pred_segments, threshold
+        )
+        precision = _safe_ratio(matched, matched + spurious)
+        recall = _safe_ratio(matched, matched + missed)
+        f1 = _safe_ratio(2.0 * precision * recall, precision + recall)
+        per_iou[f"{threshold:.1f}"] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "n_matched": matched,
+            "n_missed": missed,
+            "n_spurious": spurious,
         }
-    return results
+        f1s.append(f1)
+    headline_key = f"{SEGMENT_IOU_HEADLINE:.1f}"
+    return {
+        "mean_f1": float(np.mean(f1s)) if f1s else 0.0,
+        "headline_iou": SEGMENT_IOU_HEADLINE,
+        "headline_f1": per_iou.get(headline_key, {}).get("f1"),
+        "n_ground_truth": len(gt_segments),
+        "n_predicted": len(pred_segments),
+        "per_iou": per_iou,
+    }
 
 
 def score_prediction_runs(runs: Sequence[PredictionRun]) -> Dict[str, object]:
@@ -228,7 +237,12 @@ def normalizer_from_state(state: Mapping[str, object]) -> FeatureNormalizer:
 
 
 def validate_checkpoint(
-    checkpoint: Mapping[str, object], expected_fold: int, expected_model_type: str, expected_seed: int
+    checkpoint: Mapping[str, object],
+    expected_fold: int,
+    expected_model_type: str,
+    expected_seed: int,
+    expected_training_mode: str | None = None,
+    expected_validation_block: int | None = None,
 ) -> ExperimentConfig:
     required = {"model_state", "config", "fold", "normalizer", "seed", "epoch"}
     missing = required.difference(checkpoint)
@@ -241,6 +255,18 @@ def validate_checkpoint(
         raise ValueError("Requested model type does not match the checkpoint")
     if int(checkpoint["seed"]) != expected_seed or config.training.seed != expected_seed:
         raise ValueError("Requested seed does not match the checkpoint")
+    if expected_training_mode is not None:
+        if checkpoint.get("training_mode") != expected_training_mode:
+            raise ValueError("Requested training mode does not match the checkpoint")
+    if expected_training_mode == "inner_cv":
+        if checkpoint.get("validation_block") != expected_validation_block:
+            raise ValueError("Requested validation block does not match the checkpoint")
+        if config.split.validation_block != expected_validation_block:
+            raise ValueError("Checkpoint configuration has the wrong validation block")
+    if expected_training_mode == "full_half_refit" and checkpoint.get(
+        "validation_block"
+    ) is not None:
+        raise ValueError("A refit checkpoint cannot contain a validation block")
     config.validate(float(checkpoint.get("source_fps", 10.0)))
     normalizer_from_state(checkpoint["normalizer"])
     return config
@@ -315,7 +341,23 @@ def validate_run_coverage(
 
 
 def checkpoint_path(runs_dir: str | Path, fold: int, model_type: str, seed: int) -> Path:
-    return Path(runs_dir) / f"fold{fold}_{model_type}_seed{seed}" / "best_checkpoint.pt"
+    return (
+        Path(runs_dir)
+        / f"fold{fold}_{model_type}_seed{seed}"
+        / "refit"
+        / "final_checkpoint.pt"
+    )
+
+
+def inner_checkpoint_path(
+    runs_dir: str | Path, fold: int, model_type: str, seed: int, validation_block: int
+) -> Path:
+    return (
+        Path(runs_dir)
+        / f"fold{fold}_{model_type}_seed{seed}"
+        / f"inner_block{validation_block}"
+        / "best_checkpoint.pt"
+    )
 
 
 def evaluate_checkpoint(
@@ -325,6 +367,8 @@ def evaluate_checkpoint(
     expected_seed: int,
     partition: str,
     device_name: str = "auto",
+    training_mode: str = "full_half_refit",
+    validation_block: int | None = None,
 ) -> CheckpointEvaluation:
     """Load a best checkpoint and evaluate one fold partition."""
     if partition not in ("train", "validation", "test"):
@@ -333,16 +377,34 @@ def evaluate_checkpoint(
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if training_mode not in ("inner_cv", "full_half_refit"):
+        raise ValueError("training_mode must be inner_cv or full_half_refit")
+    if training_mode == "inner_cv" and validation_block not in (1, 2, 3):
+        raise ValueError("Inner evaluation requires validation_block 1, 2 or 3")
+    if training_mode == "full_half_refit" and partition == "validation":
+        raise ValueError("A full-half refit has no validation partition")
     config = validate_checkpoint(
-        checkpoint, expected_fold, expected_model_type, expected_seed
+        checkpoint,
+        expected_fold,
+        expected_model_type,
+        expected_seed,
+        training_mode,
+        validation_block,
     )
     raw = load_wcsf_data(config.data.feature_path, config.data.label_path)
     if float(checkpoint.get("source_fps", raw.source_fps)) != raw.source_fps:
         raise ValueError("Checkpoint and feature archive source frequencies disagree")
-    buffer_frames = config.seconds_to_frames(config.split.buffer_seconds, raw.source_fps)
-    split = build_fold_split(
-        raw.half_id, expected_fold, config.split.validation_fraction, buffer_frames
-    )
+    if training_mode == "full_half_refit":
+        split = build_refit_split(raw.half_id, expected_fold)
+    else:
+        buffer_frames = config.seconds_to_frames(config.split.buffer_seconds, raw.source_fps)
+        split = build_fold_split(
+            raw.half_id,
+            expected_fold,
+            config.split.validation_fraction,
+            buffer_frames,
+            int(validation_block),
+        )
     data = _normalized_data(raw, normalizer_from_state(checkpoint["normalizer"]))
     device = select_device(device_name)
     model = build_model(config.model).to(device)
@@ -355,12 +417,14 @@ def evaluate_checkpoint(
     validate_run_coverage(runs, split, partition, raw.n_frames)
     metrics = score_prediction_runs(runs)
     report: Dict[str, object] = {
-        "schema_version": "wcsf_alive_dead_evaluation_v1",
+        "schema_version": "wcsf_alive_dead_evaluation_v2",
         "evaluation_type": "single_fold",
         "fold": expected_fold,
         "partition": partition,
         "model_type": expected_model_type,
         "seed": expected_seed,
+        "training_mode": training_mode,
+        "validation_block": validation_block,
         "checkpoint": str(path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "classification_threshold": THRESHOLD,
@@ -434,7 +498,7 @@ def evaluate_oof(
     )
     runs = combine_oof_runs(fold1, fold2)
     return {
-        "schema_version": "wcsf_alive_dead_evaluation_v1",
+        "schema_version": "wcsf_alive_dead_evaluation_v2",
         "evaluation_type": "combined_oof",
         "model_type": model_type,
         "seed": seed,
@@ -452,6 +516,47 @@ def evaluate_oof(
     }
 
 
+def evaluate_inner_blocks(
+    fold: int,
+    model_type: str,
+    seed: int,
+    runs_dir: str | Path,
+    device_name: str = "auto",
+) -> Dict[str, object]:
+    """Evaluate all three inner validation checkpoints without touching test data."""
+    evaluations = {}
+    for block in (1, 2, 3):
+        result = evaluate_checkpoint(
+            inner_checkpoint_path(runs_dir, fold, model_type, seed, block),
+            fold,
+            model_type,
+            seed,
+            "validation",
+            device_name,
+            training_mode="inner_cv",
+            validation_block=block,
+        )
+        evaluations[str(block)] = result.report
+    return {
+        "schema_version": "wcsf_alive_dead_inner_cv_v1",
+        "evaluation_type": "inner_validation_aggregate",
+        "fold": fold,
+        "model_type": model_type,
+        "seed": seed,
+        "blocks": evaluations,
+        "mean_frame_macro_f1": float(
+            np.mean(
+                [report["frame_metrics"]["macro_f1"] for report in evaluations.values()]
+            )
+        ),
+        "mean_binary_segment_f1": float(
+            np.mean(
+                [report["segment_metrics"]["mean_f1"] for report in evaluations.values()]
+            )
+        ),
+    }
+
+
 def _print_metrics(title: str, report: Mapping[str, object]) -> None:
     frame = report["frame_metrics"]
     segments = report["segment_metrics"]
@@ -459,8 +564,8 @@ def _print_metrics(title: str, report: Mapping[str, object]) -> None:
     print(f"  frames: {report['n_frames']}")
     print(f"  accuracy: {frame['accuracy']:.4f}")
     print(f"  macro F1: {frame['macro_f1']:.4f}")
-    print(f"  segment macro F1 @0.50: {segments['0.50']['macro_f1']:.4f}")
-    print(f"  segment macro F1 @0.75: {segments['0.75']['macro_f1']:.4f}")
+    print(f"  binary segment F1 mean: {segments['mean_f1']:.4f}")
+    print(f"  binary segment F1 @0.5: {segments['headline_f1']:.4f}")
     print(f"  confusion [rows=true, cols=pred]: {frame['confusion_matrix']}")
 
 
@@ -479,6 +584,7 @@ def main() -> None:
     parser.add_argument(
         "--partition", default="test", choices=("train", "validation", "test")
     )
+    parser.add_argument("--inner-block", choices=("1", "2", "3", "all"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--runs-dir", type=Path, default=Path("data/open_data_groningen/model_runs")
@@ -487,6 +593,8 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.fold == "all":
+        if args.inner_block is not None:
+            parser.error("--fold all cannot be combined with --inner-block")
         if args.partition != "test":
             parser.error("--fold all only supports the held-out test partition")
         report = evaluate_oof(args.model_type, args.seed, args.runs_dir, args.device)
@@ -496,17 +604,55 @@ def main() -> None:
         output_path = args.runs_dir / f"oof_{args.model_type}_seed{args.seed}.json"
     else:
         fold = int(args.fold)
-        evaluation = evaluate_checkpoint(
-            checkpoint_path(args.runs_dir, fold, args.model_type, args.seed),
-            fold,
-            args.model_type,
-            args.seed,
-            args.partition,
-            args.device,
-        )
-        report = evaluation.report
-        _print_metrics(f"Fold {fold} {args.partition}", report)
-        output_path = evaluation.checkpoint_path.parent / f"evaluation_{args.partition}.json"
+        if args.inner_block is not None:
+            if args.partition != "validation":
+                parser.error("--inner-block only supports --partition validation")
+            if args.inner_block == "all":
+                report = evaluate_inner_blocks(
+                    fold, args.model_type, args.seed, args.runs_dir, args.device
+                )
+                for block, block_report in report["blocks"].items():
+                    _print_metrics(f"Fold {fold} inner block {block}", block_report)
+                output_path = (
+                    args.runs_dir
+                    / f"fold{fold}_{args.model_type}_seed{args.seed}"
+                    / "evaluation_inner_validation.json"
+                )
+            else:
+                block = int(args.inner_block)
+                evaluation = evaluate_checkpoint(
+                    inner_checkpoint_path(
+                        args.runs_dir, fold, args.model_type, args.seed, block
+                    ),
+                    fold,
+                    args.model_type,
+                    args.seed,
+                    "validation",
+                    args.device,
+                    training_mode="inner_cv",
+                    validation_block=block,
+                )
+                report = evaluation.report
+                _print_metrics(f"Fold {fold} inner block {block}", report)
+                output_path = (
+                    evaluation.checkpoint_path.parent / "evaluation_validation.json"
+                )
+        else:
+            if args.partition == "validation":
+                parser.error("Refit models have no validation partition; use --inner-block")
+            evaluation = evaluate_checkpoint(
+                checkpoint_path(args.runs_dir, fold, args.model_type, args.seed),
+                fold,
+                args.model_type,
+                args.seed,
+                args.partition,
+                args.device,
+            )
+            report = evaluation.report
+            _print_metrics(f"Fold {fold} refit {args.partition}", report)
+            output_path = (
+                evaluation.checkpoint_path.parent / f"evaluation_{args.partition}.json"
+            )
 
     _write_json(output_path, report)
     print(f"Saved: {output_path}")

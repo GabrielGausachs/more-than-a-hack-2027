@@ -2,7 +2,7 @@
 
 from .config import ExperimentConfig, load_config
 from .dataset import LoaderBundle, WCSFData, build_dataloaders, load_wcsf_data
-from .splits import FoldSplit, Segment, build_fold_split
+from .splits import FoldSplit, Segment, build_fold_split, build_refit_split
 
 __all__ = [
     "ExperimentConfig",
@@ -12,6 +12,7 @@ __all__ = [
     "WCSFData",
     "build_dataloaders",
     "build_fold_split",
+    "build_refit_split",
     "load_config",
     "load_wcsf_data",
 ]

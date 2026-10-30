@@ -12,7 +12,7 @@ final challenge evaluation or H/A ownership model.
 - `dataset.py` loads aligned NPZ archives and creates contiguous temporal windows.
 - `player_encoder.py` implements the permutation-invariant player-set encoder.
 - `tcn.py` contains the shared noncausal residual TCN and both model frontends.
-- `train.py` contains future training, validation, checkpointing and history logging.
+- `train.py` runs the three inner trainings, validation summaries and full-half refit.
 
 PyTorch is required but is intentionally not installed by this package. Install a build appropriate
 for the target CPU/CUDA environment before importing or running the modeling code.
@@ -47,14 +47,17 @@ global_index             (B,T)
 
 All intervals are half-open global archive indices.
 
-| Fold | Train | Buffer | Validation | Test |
-|---|---|---|---|---|
-| 1 | `[0,11806)`, `[16208,28014)` | `[11806,11906)`, `[16108,16208)` | `[11906,16108)` | `[28014,57374)` |
-| 2 | `[28014,40392)`, `[44996,57374)` | `[40392,40492)`, `[44896,44996)` | `[40492,44896)` | `[0,28014)` |
+Each outer fold keeps the opposite half untouched as test data. Three inner runs place a
+`round(15%)` validation block at fixed locations within the training half:
 
-The validation interval is the centered `round(15%)` block of the training half. The two adjacent
-buffers are each 100 frames (10 seconds). Windows are constructed independently inside each
-segment and can never cross a half, partition, buffer or disconnected training interval.
+| Fold | Block 1 | Block 2 | Block 3 | Outer test |
+|---|---|---|---|---|
+| 1 | `[4902,9104)` | `[11906,16108)` | `[18909,23111)` | `[28014,57374)` |
+| 2 | `[33152,37556)` | `[40492,44896)` | `[47832,52236)` | `[0,28014)` |
+
+Every inner validation interval has a 100-frame (10-second) buffer on both sides. All remaining
+parts of the training half are independent training segments. Windows can never cross a half,
+partition, buffer or disconnected training interval.
 
 The default 100-frame training windows use stride 50. Inverse-coverage loss weights ensure each
 original frame has total weight one per epoch despite overlap. Validation and future test windows
@@ -62,7 +65,8 @@ use stride 100, with right padding and an output mask on the final window.
 
 ## Normalization
 
-Normalization is fitted separately for every fold using only its training mask:
+Normalization is fitted separately for each inner block using only that block's training mask.
+The final refit normalizer uses the complete training half:
 
 - Player X/Y remain in their existing normalized pitch coordinates.
 - Valid player speeds share one training-fold mean and standard deviation across both teams.
@@ -71,8 +75,8 @@ Normalization is fitted separately for every fold using only its training mask:
 - Tracked-player count, valid-speed count and speed coverage remain in their original scales.
 - Invalid and padded values remain zero and masks are unchanged.
 
-The fitted parameters are stored in future checkpoints. Validation, buffer and test frames never
-contribute to fitting.
+The fitted parameters are stored in checkpoints. Inner validation/buffer/test frames never enter
+inner normalization, and outer test frames never enter refit normalization.
 
 ## Models
 
@@ -96,7 +100,7 @@ convolutions per block and 64 channels. Its receptive field is:
 Its context radius is 30 frames on either side. Configuration validation rejects a receptive field
 larger than either the sequence or validation buffer.
 
-## Future training
+## Training
 
 Defaults can be used directly:
 
@@ -112,24 +116,42 @@ fields:
 python -m modeling.alive_dead.train --config path/to/config.json
 ```
 
-Training uses AdamW, unweighted masked BCE, ReduceLROnPlateau, gradient clipping and validation-loss
-early stopping. Runs are written below `data/open_data_groningen/model_runs/`, which is already
-excluded by the repository's `data/` ignore rule. The training function constructs a test loader
-but never evaluates it.
+One command runs all three inner blocks and then the full-half refit. Inner runs use AdamW,
+unweighted masked BCE, ReduceLROnPlateau, gradient clipping and validation-loss early stopping.
+Their median best epoch becomes the fixed refit length. The refit starts from new weights, uses
+the complete training half, constant configured learning rate and no validation-dependent
+scheduler. It never iterates the outer test loader.
+
+Artifacts are kept separate from legacy single-block runs:
+
+```text
+fold1_team_tcn_seed42/
+  inner_block1/history.json, best_checkpoint.pt, evaluation_validation.json
+  inner_block2/history.json, best_checkpoint.pt, evaluation_validation.json
+  inner_block3/history.json, best_checkpoint.pt, evaluation_validation.json
+  cv_summary.json
+  refit/history.json, final_checkpoint.pt
+```
 
 ## Evaluation
 
-Evaluation is a separate checkpoint-based command. It restores the normalizer saved in the best
-checkpoint and never refits statistics. A single fold and partition can be evaluated with:
+Evaluation is checkpoint-based and restores the saved normalizer without refitting. Train and test
+evaluation use the final full-half refit checkpoint:
 
 ```powershell
 python -m modeling.alive_dead.evaluate --fold 1 --model-type team_tcn --partition test
-python -m modeling.alive_dead.evaluate --fold 2 --model-type deepsets_tcn --partition validation
+python -m modeling.alive_dead.evaluate --fold 2 --model-type deepsets_tcn --partition train
 ```
 
-`--partition` accepts `train`, `validation` or `test`. Each genuinely contiguous partition segment
-is inferred as one sequence, so temporal metrics are never calculated independently per training
-window and no segment can cross a buffer, disconnected interval or halftime.
+Refit models have no validation partition. Evaluate one or all inner validation checkpoints with:
+
+```powershell
+python -m modeling.alive_dead.evaluate --fold 1 --model-type team_tcn --partition validation --inner-block 1
+python -m modeling.alive_dead.evaluate --fold 1 --model-type team_tcn --partition validation --inner-block all
+```
+
+Each genuinely contiguous partition segment is inferred as one sequence, so temporal metrics are
+never calculated independently per training window and no segment crosses a buffer or halftime.
 
 After both folds have been trained, combine their held-out predictions with:
 
@@ -142,14 +164,18 @@ The combined out-of-fold result uses Fold 2 to predict the first half and Fold 1
 second half. Every scored frame therefore comes from a model that did not train on that half.
 
 Predictions use a fixed threshold of `sigmoid(logit) >= 0.5`. Reports contain accuracy, binary
-confusion matrix, per-class precision/recall/F1, macro F1, and per-class plus macro segment F1 at
-temporal IoU 0.50 and 0.75. Confusion-matrix rows are ground truth, columns are predictions, and
-the class order is `DEAD`, `ALIVE`. Segment matching is one-to-one and performed independently for
-both classes.
+confusion matrix, per-class precision/recall/F1 and macro F1. Confusion-matrix rows are ground
+truth, columns are predictions, and the class order is `DEAD`, `ALIVE`.
 
-Individual reports are saved as `evaluation_<partition>.json` in the run directory. Combined
-reports are saved as `oof_<model_type>_seed<seed>.json` in the model-runs directory. Evaluation
-does not modify checkpoints and does not run automatically during training.
+The binary segment score follows the competition's `spellF1` structure: ALIVE and DEAD runs are
+pooled, same-label segments are matched one-to-one by descending temporal IoU, and F1 is averaged
+over thresholds `0.3, 0.4, 0.5, 0.6, 0.7`. F1@0.5 is also reported as the headline threshold.
+Unlike the official possession score, this binary diagnostic includes DEAD segments and cannot
+separate consecutive Home and Away possessions inside one uninterrupted ALIVE interval.
+
+Individual reports are saved beside the checkpoint they evaluate. Combined reports are saved as
+`oof_<model_type>_seed<seed>.json` in the model-runs directory. Inner validation evaluation runs
+during cross-validation; outer train/test evaluation remains a separate explicit command.
 
 ## Not implemented yet
 

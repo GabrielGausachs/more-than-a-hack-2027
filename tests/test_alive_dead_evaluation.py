@@ -11,10 +11,12 @@ from modeling.alive_dead.evaluate import (
     CheckpointEvaluation,
     PredictionRun,
     combine_oof_runs,
+    checkpoint_path,
     compute_frame_metrics,
     compute_segment_metrics,
     extract_segments,
     normalizer_from_state,
+    inner_checkpoint_path,
     validate_checkpoint,
     validate_run_coverage,
 )
@@ -45,35 +47,34 @@ class FrameMetricTests(unittest.TestCase):
 
 
 class SegmentMetricTests(unittest.TestCase):
-    def test_iou_thresholds_and_per_class_macro(self):
+    def test_metrica_style_iou_mean_and_headline(self):
         run = prediction_run(
             0,
             [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0],
             [0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0],
         )
         result = compute_segment_metrics([run])
-        self.assertAlmostEqual(result["0.50"]["macro_f1"], 1.0)
-        self.assertAlmostEqual(result["0.75"]["per_class"]["DEAD"]["f1"], 1.0)
-        self.assertAlmostEqual(result["0.75"]["per_class"]["ALIVE"]["f1"], 0.0)
-        self.assertAlmostEqual(result["0.75"]["macro_f1"], 0.5)
+        self.assertEqual(tuple(result["per_iou"]), ("0.3", "0.4", "0.5", "0.6", "0.7"))
+        self.assertAlmostEqual(result["headline_f1"], 1.0)
+        self.assertAlmostEqual(result["per_iou"]["0.7"]["f1"], 2.0 / 3.0)
+        self.assertAlmostEqual(result["mean_f1"], (4.0 + 2.0 / 3.0) / 5.0)
+        self.assertEqual(result["n_ground_truth"], 3)
+        self.assertEqual(result["n_predicted"], 3)
 
     def test_disconnected_runs_are_not_merged(self):
         first = prediction_run(0, [1, 1, 1], half_id=1)
         second = prediction_run(10, [1, 1], half_id=2)
         self.assertEqual(len(extract_segments(first.labels)), 1)
         result = compute_segment_metrics([first, second])
-        self.assertEqual(result["0.50"]["per_class"]["ALIVE"]["n_ground_truth"], 2)
-        self.assertEqual(result["0.50"]["per_class"]["ALIVE"]["n_predicted"], 2)
+        self.assertEqual(result["n_ground_truth"], 2)
+        self.assertEqual(result["n_predicted"], 2)
+        self.assertAlmostEqual(result["mean_f1"], 1.0)
 
     def test_one_prediction_can_match_only_one_ground_truth_segment(self):
         run = prediction_run(0, [1, 1, 0, 1, 1], [1, 1, 1, 1, 1])
-        result = compute_segment_metrics([run], thresholds=(0.30,))["0.30"]["per_class"][
-            "ALIVE"
-        ]
-        self.assertEqual(result["n_ground_truth"], 2)
-        self.assertEqual(result["n_predicted"], 1)
+        result = compute_segment_metrics([run])["per_iou"]["0.3"]
         self.assertEqual(result["n_matched"], 1)
-        self.assertEqual(result["n_missed"], 1)
+        self.assertEqual(result["n_missed"], 2)
         self.assertEqual(result["n_spurious"], 0)
 
 
@@ -112,6 +113,28 @@ class CheckpointAndCoverageTests(unittest.TestCase):
             validate_checkpoint(self._checkpoint(fold=1), 2, "team_tcn", 42)
         with self.assertRaisesRegex(ValueError, "model type"):
             validate_checkpoint(self._checkpoint(), 1, "deepsets_tcn", 42)
+
+    def test_new_paths_never_select_legacy_root_checkpoint(self):
+        root = Path("runs")
+        self.assertEqual(
+            checkpoint_path(root, 1, "team_tcn", 42),
+            root / "fold1_team_tcn_seed42/refit/final_checkpoint.pt",
+        )
+        self.assertEqual(
+            inner_checkpoint_path(root, 1, "team_tcn", 42, 3),
+            root / "fold1_team_tcn_seed42/inner_block3/best_checkpoint.pt",
+        )
+
+    def test_training_mode_and_block_mismatch_are_rejected(self):
+        checkpoint = self._checkpoint()
+        checkpoint["training_mode"] = "inner_cv"
+        checkpoint["validation_block"] = 1
+        checkpoint["config"]["split"]["validation_block"] = 1
+        validate_checkpoint(checkpoint, 1, "team_tcn", 42, "inner_cv", 1)
+        with self.assertRaisesRegex(ValueError, "validation block"):
+            validate_checkpoint(checkpoint, 1, "team_tcn", 42, "inner_cv", 2)
+        with self.assertRaisesRegex(ValueError, "training mode"):
+            validate_checkpoint(checkpoint, 1, "team_tcn", 42, "full_half_refit")
 
     def test_incomplete_partition_coverage_is_rejected(self):
         half_id = np.r_[np.ones(20, dtype=np.int8), np.full(20, 2, dtype=np.int8)]

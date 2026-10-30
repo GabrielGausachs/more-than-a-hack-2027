@@ -1,22 +1,27 @@
-"""Lightweight non-training tests for the ALIVE/DEAD modeling package.
-
-These tests require PyTorch. They are intentionally not executed during initial implementation.
-"""
+"""Lightweight integrity tests for the ALIVE/DEAD modeling package."""
 
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
 
 from modeling.alive_dead.config import ExperimentConfig, ModelConfig
-from modeling.alive_dead.dataset import TemporalWindowDataset, WCSFData, load_wcsf_data
+from modeling.alive_dead.dataset import (
+    TemporalWindowDataset,
+    WCSFData,
+    build_dataloaders,
+    load_wcsf_data,
+)
 from modeling.alive_dead.player_encoder import DeepSetPlayerEncoder
 from modeling.alive_dead.preprocessing import FeatureNormalizer
-from modeling.alive_dead.splits import Segment, build_fold_split
+from modeling.alive_dead.splits import Segment, build_fold_split, build_refit_split
 from modeling.alive_dead.tcn import build_model
 from modeling.alive_dead.train import masked_bce_components
+from modeling.alive_dead.train import run_cross_validation
 
 
 def synthetic_data(n_frames=24):
@@ -50,20 +55,47 @@ def synthetic_data(n_frames=24):
 
 
 class SplitTests(unittest.TestCase):
-    def test_exact_full_data_fold_boundaries(self):
+    def test_exact_three_block_fold_boundaries(self):
         half_id = np.r_[np.ones(28014, dtype=np.int8), np.full(29360, 2, dtype=np.int8)]
-        fold1 = build_fold_split(half_id, 1, 0.15, 100)
-        fold2 = build_fold_split(half_id, 2, 0.15, 100)
-        self.assertEqual([segment.start for segment in fold1.segments["train"]], [0, 16208])
-        self.assertEqual([segment.end for segment in fold1.segments["train"]], [11806, 28014])
-        self.assertEqual(np.flatnonzero(fold1.validation_mask)[[0, -1]].tolist(), [11906, 16107])
+        expected = {
+            1: [(4902, 9104), (11906, 16108), (18909, 23111)],
+            2: [(33152, 37556), (40492, 44896), (47832, 52236)],
+        }
+        for fold in (1, 2):
+            for block, interval in enumerate(expected[fold], 1):
+                split = build_fold_split(half_id, fold, 0.15, 100, block)
+                validation = split.segments["validation"][0]
+                self.assertEqual((validation.start, validation.end), interval)
+                self.assertEqual(split.validation_block, block)
+                left_buffer, right_buffer = split.segments["buffer"]
+                self.assertEqual(
+                    (left_buffer.start, left_buffer.end),
+                    (validation.start - 100, validation.start),
+                )
+                self.assertEqual(
+                    (right_buffer.start, right_buffer.end),
+                    (validation.end, validation.end + 100),
+                )
+                left_train, right_train = split.segments["train"]
+                self.assertEqual(left_train.end, left_buffer.start)
+                self.assertEqual(right_train.start, right_buffer.end)
+                self.assertEqual(np.count_nonzero(split.buffer_mask), 200)
+                self.assertEqual(
+                    np.count_nonzero(split.validation_mask), 4202 if fold == 1 else 4404
+                )
+                split.assert_valid()
+
+    def test_full_half_refit_has_no_validation_or_buffer(self):
+        half_id = np.r_[np.ones(28014, dtype=np.int8), np.full(29360, 2, dtype=np.int8)]
+        fold1 = build_refit_split(half_id, 1)
+        fold2 = build_refit_split(half_id, 2)
         self.assertEqual(
             tuple(map(np.count_nonzero, (fold1.train_mask, fold1.validation_mask, fold1.buffer_mask, fold1.test_mask))),
-            (23612, 4202, 200, 29360),
+            (28014, 0, 0, 29360),
         )
         self.assertEqual(
             tuple(map(np.count_nonzero, (fold2.train_mask, fold2.validation_mask, fold2.buffer_mask, fold2.test_mask))),
-            (24756, 4404, 200, 28014),
+            (29360, 0, 0, 28014),
         )
         fold1.assert_valid()
         fold2.assert_valid()
@@ -188,6 +220,107 @@ class RealArchiveLoadingTests(unittest.TestCase):
         self.assertEqual(data.labels.shape, (57374,))
         self.assertFalse(hasattr(data, "alive_vote_fraction"))
         self.assertFalse(hasattr(data, "dead_vote_count"))
+
+    def test_refit_normalizer_uses_complete_training_half_only(self):
+        root = Path(__file__).resolve().parents[1]
+        feature_path = root / "data/open_data_groningen/processed/wcsf_player_team_features.npz"
+        label_path = root / "data/open_data_groningen/processed/wcsf_alive_dead_labels.npz"
+        if not feature_path.exists() or not label_path.exists():
+            self.skipTest("Local processed WCSF archives are unavailable")
+        config = ExperimentConfig()
+        config.data.feature_path = str(feature_path)
+        config.data.label_path = str(label_path)
+        refit_loaders = build_dataloaders(config, full_half_refit=True)
+        self.assertEqual(np.count_nonzero(refit_loaders.split.train_mask), 28014)
+        self.assertEqual(len(refit_loaders.validation.dataset), 0)
+        self.assertFalse(
+            refit_loaders.split.test_mask[refit_loaders.split.train_mask].any()
+        )
+        raw = load_wcsf_data(feature_path, label_path)
+        expected_refit = FeatureNormalizer.fit(
+            raw.players,
+            raw.player_speed_valid,
+            raw.team_features,
+            raw.team_feature_valid,
+            refit_loaders.split.train_mask,
+        )
+        np.testing.assert_allclose(
+            refit_loaders.normalizer.team_speed_mean, expected_refit.team_speed_mean
+        )
+        self.assertAlmostEqual(
+            refit_loaders.normalizer.player_speed_mean,
+            expected_refit.player_speed_mean,
+        )
+
+        config.split.validation_block = 1
+        inner_loaders = build_dataloaders(config)
+        excluded = (
+            inner_loaders.split.validation_mask
+            | inner_loaders.split.buffer_mask
+            | inner_loaders.split.test_mask
+        )
+        self.assertFalse(inner_loaders.split.train_mask[excluded].any())
+        expected_inner = FeatureNormalizer.fit(
+            raw.players,
+            raw.player_speed_valid,
+            raw.team_features,
+            raw.team_feature_valid,
+            inner_loaders.split.train_mask,
+        )
+        np.testing.assert_allclose(
+            inner_loaders.normalizer.team_speed_mean,
+            expected_inner.team_speed_mean,
+        )
+        self.assertAlmostEqual(
+            inner_loaders.normalizer.player_speed_mean,
+            expected_inner.player_speed_mean,
+        )
+
+
+class CrossValidationWorkflowTests(unittest.TestCase):
+    def test_three_blocks_choose_median_epoch_before_refit(self):
+        config = ExperimentConfig()
+        config.model.model_type = "team_tcn"
+        best_epochs = {1: 5, 2: 9, 3: 7}
+
+        def fake_train(inner_config, run_dir):
+            run_dir = Path(run_dir)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            block = inner_config.split.validation_block
+            return {
+                "checkpoint_path": str(run_dir / "best_checkpoint.pt"),
+                "best_validation_loss": 0.4 - block * 0.01,
+                "best_epoch": best_epochs[block],
+            }
+
+        def fake_evaluate(*args, validation_block, **kwargs):
+            return SimpleNamespace(
+                report={
+                    "runs": [{"start": validation_block * 10, "end": validation_block * 10 + 5}],
+                    "frame_metrics": {"macro_f1": 0.8 + validation_block * 0.01},
+                    "segment_metrics": {"mean_f1": 0.5 + validation_block * 0.01},
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config.training.output_dir = temporary
+            with mock.patch(
+                "modeling.alive_dead.train.train_experiment", side_effect=fake_train
+            ) as inner_train, mock.patch(
+                "modeling.alive_dead.train.evaluate_checkpoint", side_effect=fake_evaluate
+            ), mock.patch(
+                "modeling.alive_dead.train.train_full_half_refit",
+                return_value={"checkpoint_path": "final_checkpoint.pt"},
+            ) as refit:
+                summary = run_cross_validation(config)
+
+            self.assertEqual(inner_train.call_count, 3)
+            self.assertEqual(summary["inner_best_epochs"], [5, 9, 7])
+            self.assertEqual(summary["refit_epochs"], 7)
+            self.assertEqual(refit.call_args.args[1], 7)
+            self.assertTrue(
+                (Path(temporary) / "fold1_team_tcn_seed42/cv_summary.json").exists()
+            )
 
 
 if __name__ == "__main__":

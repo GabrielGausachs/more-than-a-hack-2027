@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .config import ExperimentConfig
 from .preprocessing import FeatureNormalizer
-from .splits import FoldSplit, Segment, build_fold_split
+from .splits import FoldSplit, Segment, build_fold_split, build_refit_split
 
 
 @dataclass(frozen=True)
@@ -202,17 +202,23 @@ class LoaderBundle:
     data: WCSFData
 
 
-def build_dataloaders(config: ExperimentConfig) -> LoaderBundle:
-    """Build aligned, normalized loaders for one deterministic fold."""
+def build_dataloaders(
+    config: ExperimentConfig, full_half_refit: bool = False
+) -> LoaderBundle:
+    """Build aligned normalized loaders for an inner split or full-half refit."""
     raw = load_wcsf_data(config.data.feature_path, config.data.label_path)
     config.validate(raw.source_fps)
-    buffer_frames = config.seconds_to_frames(config.split.buffer_seconds, raw.source_fps)
-    split = build_fold_split(
-        raw.half_id,
-        config.split.fold,
-        config.split.validation_fraction,
-        buffer_frames,
-    )
+    if full_half_refit:
+        split = build_refit_split(raw.half_id, config.split.fold)
+    else:
+        buffer_frames = config.seconds_to_frames(config.split.buffer_seconds, raw.source_fps)
+        split = build_fold_split(
+            raw.half_id,
+            config.split.fold,
+            config.split.validation_fraction,
+            buffer_frames,
+            config.split.validation_block,
+        )
     normalizer = FeatureNormalizer.fit(
         raw.players,
         raw.player_speed_valid,

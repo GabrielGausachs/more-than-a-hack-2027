@@ -1,11 +1,9 @@
-"""Future training entry point for WCSF ALIVE/DEAD models.
-
-This module defines training infrastructure but does not execute unless called explicitly.
-"""
+"""Purged three-block cross-validation and full-half refit training."""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 from dataclasses import dataclass
@@ -19,6 +17,7 @@ from torch import nn
 
 from .config import ExperimentConfig, load_config
 from .dataset import LoaderBundle, build_dataloaders
+from .evaluate import evaluate_checkpoint
 from .tcn import build_model
 
 
@@ -111,16 +110,19 @@ def run_epoch(
 def _checkpoint_payload(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau,
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None,
     config: ExperimentConfig,
     loaders: LoaderBundle,
     epoch: int,
-    best_validation_loss: float,
+    best_validation_loss: float | None,
+    training_mode: str,
+    validation_block: int | None,
+    inner_best_epochs: list[int] | None = None,
 ) -> Dict[str, object]:
     return {
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "config": config.to_dict(),
         "fold": config.split.fold,
         "normalizer": loaders.normalizer.state_dict(),
@@ -129,11 +131,16 @@ def _checkpoint_payload(
         "best_validation_loss": best_validation_loss,
         "source_fps": loaders.data.source_fps,
         "receptive_field_frames": config.model.receptive_field_frames,
+        "training_mode": training_mode,
+        "validation_block": validation_block,
+        "inner_best_epochs": inner_best_epochs,
     }
 
 
-def train_experiment(config: ExperimentConfig) -> Dict[str, object]:
-    """Train one configured fold/model; held-out test data is never iterated here."""
+def train_experiment(
+    config: ExperimentConfig, run_dir: str | Path | None = None
+) -> Dict[str, object]:
+    """Train one inner validation block; held-out test data is never iterated."""
     set_reproducible_seed(config.training.seed)
     loaders = build_dataloaders(config)
     device = select_device(config.training.device)
@@ -150,10 +157,13 @@ def train_experiment(config: ExperimentConfig) -> Dict[str, object]:
         patience=config.training.scheduler_patience,
     )
 
-    run_name = (
-        f"fold{config.split.fold}_{config.model.model_type}_seed{config.training.seed}"
-    )
-    run_dir = Path(config.training.output_dir) / run_name
+    if run_dir is None:
+        run_dir = (
+            Path(config.training.output_dir)
+            / f"fold{config.split.fold}_{config.model.model_type}_seed{config.training.seed}"
+            / f"inner_block{config.split.validation_block}"
+        )
+    run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     history_path = run_dir / "history.json"
     checkpoint_path = run_dir / "best_checkpoint.pt"
@@ -193,6 +203,8 @@ def train_experiment(config: ExperimentConfig) -> Dict[str, object]:
                     loaders,
                     epoch,
                     best_validation_loss,
+                    "inner_cv",
+                    config.split.validation_block,
                 ),
                 checkpoint_path,
             )
@@ -206,7 +218,145 @@ def train_experiment(config: ExperimentConfig) -> Dict[str, object]:
         "checkpoint_path": str(checkpoint_path),
         "best_validation_loss": best_validation_loss,
         "epochs_completed": len(history),
+        "best_epoch": min(history, key=lambda item: item["validation_loss"])["epoch"],
     }
+
+
+def train_full_half_refit(
+    config: ExperimentConfig,
+    epochs: int,
+    run_dir: str | Path,
+    inner_best_epochs: list[int],
+) -> Dict[str, object]:
+    """Refit from scratch on the complete training half for a fixed epoch count."""
+    if epochs < 1:
+        raise ValueError("Refit epochs must be positive")
+    set_reproducible_seed(config.training.seed)
+    loaders = build_dataloaders(config, full_half_refit=True)
+    if loaders.split.validation_mask.any() or loaders.split.buffer_mask.any():
+        raise ValueError("A full-half refit cannot contain validation or buffer frames")
+    device = select_device(config.training.device)
+    model = build_model(config.model).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
+    )
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    history_path = run_dir / "history.json"
+    checkpoint_path = run_dir / "final_checkpoint.pt"
+    history = []
+    for epoch in range(1, epochs + 1):
+        train_stats = run_epoch(
+            model,
+            loaders.train,
+            device,
+            optimizer,
+            config.training.gradient_clip_norm,
+        )
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_stats.loss,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            }
+        )
+        with history_path.open("w", encoding="utf-8") as handle:
+            json.dump(history, handle, indent=2)
+    torch.save(
+        _checkpoint_payload(
+            model,
+            optimizer,
+            None,
+            config,
+            loaders,
+            epochs,
+            None,
+            "full_half_refit",
+            None,
+            inner_best_epochs,
+        ),
+        checkpoint_path,
+    )
+    return {
+        "run_dir": str(run_dir),
+        "checkpoint_path": str(checkpoint_path),
+        "epochs_completed": epochs,
+    }
+
+
+def run_cross_validation(config: ExperimentConfig) -> Dict[str, object]:
+    """Run three inner blocks, summarize validation, then refit the complete half."""
+    config.validate()
+    parent = (
+        Path(config.training.output_dir)
+        / f"fold{config.split.fold}_{config.model.model_type}_seed{config.training.seed}"
+    )
+    block_results = []
+    best_epochs = []
+    for block in (1, 2, 3):
+        inner_config = copy.deepcopy(config)
+        inner_config.split.validation_block = block
+        block_dir = parent / f"inner_block{block}"
+        training_result = train_experiment(inner_config, block_dir)
+        evaluation = evaluate_checkpoint(
+            training_result["checkpoint_path"],
+            inner_config.split.fold,
+            inner_config.model.model_type,
+            inner_config.training.seed,
+            "validation",
+            inner_config.training.device,
+            training_mode="inner_cv",
+            validation_block=block,
+        )
+        evaluation_path = block_dir / "evaluation_validation.json"
+        with evaluation_path.open("w", encoding="utf-8") as handle:
+            json.dump(evaluation.report, handle, indent=2)
+        best_epoch = int(training_result["best_epoch"])
+        best_epochs.append(best_epoch)
+        block_results.append(
+            {
+                "validation_block": block,
+                "validation_interval": evaluation.report["runs"][0],
+                "best_epoch": best_epoch,
+                "best_validation_bce": training_result["best_validation_loss"],
+                "frame_macro_f1": evaluation.report["frame_metrics"]["macro_f1"],
+                "binary_segment_mean_f1": evaluation.report["segment_metrics"][
+                    "mean_f1"
+                ],
+                "checkpoint_path": training_result["checkpoint_path"],
+            }
+        )
+
+    refit_epochs = int(np.median(best_epochs))
+    refit_config = copy.deepcopy(config)
+    refit_result = train_full_half_refit(
+        refit_config, refit_epochs, parent / "refit", best_epochs
+    )
+    summary = {
+        "schema_version": "wcsf_alive_dead_cv_v1",
+        "fold": config.split.fold,
+        "model_type": config.model.model_type,
+        "seed": config.training.seed,
+        "blocks": block_results,
+        "mean_best_validation_bce": float(
+            np.mean([item["best_validation_bce"] for item in block_results])
+        ),
+        "mean_frame_macro_f1": float(
+            np.mean([item["frame_macro_f1"] for item in block_results])
+        ),
+        "mean_binary_segment_f1": float(
+            np.mean([item["binary_segment_mean_f1"] for item in block_results])
+        ),
+        "inner_best_epochs": best_epochs,
+        "refit_epochs": refit_epochs,
+        "refit_checkpoint_path": refit_result["checkpoint_path"],
+    }
+    parent.mkdir(parents=True, exist_ok=True)
+    with (parent / "cv_summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    return summary
 
 
 def main() -> None:
@@ -221,7 +371,7 @@ def main() -> None:
     if args.model_type is not None:
         config.model.model_type = args.model_type
     config.validate()
-    result = train_experiment(config)
+    result = run_cross_validation(config)
     print(json.dumps(result, indent=2))
 
 

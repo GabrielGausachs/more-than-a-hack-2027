@@ -31,6 +31,7 @@ class SplitConfig:
     fold: int = 1
     validation_fraction: float = 0.15
     buffer_seconds: float = 10.0
+    validation_block: int = 2
 
 
 @dataclass
@@ -78,6 +79,8 @@ class ExperimentConfig:
             raise ValueError("fold must be 1 or 2")
         if not 0.0 < self.split.validation_fraction < 1.0:
             raise ValueError("validation_fraction must be strictly between 0 and 1")
+        if self.split.validation_block not in (1, 2, 3):
+            raise ValueError("validation_block must be 1, 2 or 3")
         if self.model.model_type not in ("team_tcn", "deepsets_tcn"):
             raise ValueError("model_type must be 'team_tcn' or 'deepsets_tcn'")
         if self.model.kernel_size < 1 or self.model.kernel_size % 2 == 0:

@@ -1,0 +1,97 @@
+"""Train-fold-only normalization for WCSF tracking features."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class FeatureNormalizer:
+    player_speed_mean: float
+    player_speed_std: float
+    team_speed_mean: np.ndarray
+    team_speed_std: np.ndarray
+    epsilon: float = 1e-6
+
+    @classmethod
+    def fit(
+        cls,
+        players: np.ndarray,
+        player_speed_valid: np.ndarray,
+        team_features: np.ndarray,
+        team_feature_valid: np.ndarray,
+        train_mask: np.ndarray,
+        epsilon: float = 1e-6,
+    ) -> "FeatureNormalizer":
+        """Fit shared-team speed statistics using training frames only."""
+        if train_mask.dtype != np.bool_ or train_mask.shape != (len(players),):
+            raise ValueError("train_mask must be Boolean with one value per frame")
+        player_mask = player_speed_valid & train_mask[:, None, None]
+        valid_player_speeds = players[..., 2][player_mask].astype(np.float64)
+        if not len(valid_player_speeds):
+            raise ValueError("Training partition contains no valid player speeds")
+        player_mean = float(valid_player_speeds.mean())
+        player_std = float(valid_player_speeds.std(ddof=0))
+        if player_std < epsilon:
+            raise ValueError("Training player-speed standard deviation is too small")
+
+        team_means = np.zeros(3, dtype=np.float64)
+        team_stds = np.zeros(3, dtype=np.float64)
+        for feature_index in range(3):
+            valid = team_feature_valid[..., feature_index] & train_mask[:, None]
+            values = team_features[..., feature_index][valid].astype(np.float64)
+            if not len(values):
+                raise ValueError(
+                    f"Training partition contains no valid team feature {feature_index}"
+                )
+            team_means[feature_index] = values.mean()
+            team_stds[feature_index] = values.std(ddof=0)
+            if team_stds[feature_index] < epsilon:
+                raise ValueError(
+                    f"Training team-feature standard deviation is too small at index {feature_index}"
+                )
+        return cls(player_mean, player_std, team_means, team_stds, epsilon)
+
+    def transform(
+        self,
+        players: np.ndarray,
+        player_location_valid: np.ndarray,
+        player_speed_valid: np.ndarray,
+        team_features: np.ndarray,
+        team_feature_valid: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply normalization while preserving masks and zero-filled invalid entries."""
+        normalized_players = players.copy()
+        normalized_players[..., :2][~player_location_valid] = 0.0
+        speed_output = np.zeros_like(normalized_players[..., 2])
+        speed_output[player_speed_valid] = (
+            players[..., 2][player_speed_valid] - self.player_speed_mean
+        ) / self.player_speed_std
+        normalized_players[..., 2] = speed_output
+
+        normalized_team = team_features.copy()
+        for feature_index in range(3):
+            valid = team_feature_valid[..., feature_index]
+            output = np.zeros_like(normalized_team[..., feature_index])
+            output[valid] = (
+                team_features[..., feature_index][valid]
+                - self.team_speed_mean[feature_index]
+            ) / self.team_speed_std[feature_index]
+            normalized_team[..., feature_index] = output
+        normalized_team[~team_feature_valid] = 0.0
+
+        if not np.isfinite(normalized_players).all() or not np.isfinite(normalized_team).all():
+            raise ValueError("Normalization produced non-finite values")
+        return normalized_players.astype(np.float32), normalized_team.astype(np.float32)
+
+    def state_dict(self) -> Dict[str, object]:
+        return {
+            "player_speed_mean": self.player_speed_mean,
+            "player_speed_std": self.player_speed_std,
+            "team_speed_mean": self.team_speed_mean.tolist(),
+            "team_speed_std": self.team_speed_std.tolist(),
+            "epsilon": self.epsilon,
+        }

@@ -56,6 +56,9 @@ def save_prediction_timeline(
     grouped = _group_runs_by_half(runs)
 
     try:
+        import matplotlib
+
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.patches import Patch
     except ImportError as exc:  # pragma: no cover - depends on local environment

@@ -1,4 +1,4 @@
-"""Checkpoint-based evaluation for WCSF ALIVE/DEAD classifiers."""
+"""Checkpoint-based evaluation for WCSF and Metrica ALIVE/DEAD classifiers."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Sequence
+from typing import Any, Dict, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -298,26 +298,17 @@ def _predict_segment(
     model: torch.nn.Module, data: WCSFData, segment: Segment, device: torch.device
 ) -> PredictionRun:
     frame_slice = slice(segment.start, segment.end)
-    output_mask = torch.ones((1, segment.length), dtype=torch.bool, device=device)
-    batch = {
-        "players": torch.from_numpy(data.players[frame_slice]).unsqueeze(0).to(device),
-        "player_location_valid": torch.from_numpy(
-            data.player_location_valid[frame_slice]
-        ).unsqueeze(0).to(device),
-        "player_speed_valid": torch.from_numpy(
-            data.player_speed_valid[frame_slice]
-        ).unsqueeze(0).to(device),
-        "team_features": torch.from_numpy(data.team_features[frame_slice]).unsqueeze(0).to(device),
-        "team_feature_valid": torch.from_numpy(
-            data.team_feature_valid[frame_slice]
-        ).unsqueeze(0).to(device),
-        "output_mask": output_mask,
-    }
-    with torch.no_grad():
-        logits = model(batch).squeeze(0)
-    if logits.shape != (segment.length,) or not torch.isfinite(logits).all():
-        raise ValueError("Model produced invalid segment logits")
-    predictions = (torch.sigmoid(logits) >= THRESHOLD).to(torch.int8).cpu().numpy()
+    probabilities = _predict_probabilities(
+        model,
+        data.players,
+        data.player_location_valid,
+        data.player_speed_valid,
+        data.team_features,
+        data.team_feature_valid,
+        segment,
+        device,
+    )
+    predictions = (probabilities >= THRESHOLD).astype(np.int8)
     return PredictionRun(
         segment.start,
         segment.end,
@@ -325,6 +316,43 @@ def _predict_segment(
         data.labels[frame_slice].copy(),
         predictions,
     )
+
+
+def _predict_probabilities(
+    model: torch.nn.Module,
+    players: np.ndarray,
+    player_location_valid: np.ndarray,
+    player_speed_valid: np.ndarray,
+    team_features: np.ndarray,
+    team_feature_valid: np.ndarray,
+    segment: Segment,
+    device: torch.device,
+) -> np.ndarray:
+    """Infer one genuinely contiguous segment and return ALIVE probabilities."""
+    frame_slice = slice(segment.start, segment.end)
+    output_mask = torch.ones((1, segment.length), dtype=torch.bool, device=device)
+    batch = {
+        "players": torch.from_numpy(players[frame_slice]).unsqueeze(0).to(device),
+        "player_location_valid": torch.from_numpy(
+            player_location_valid[frame_slice]
+        ).unsqueeze(0).to(device),
+        "player_speed_valid": torch.from_numpy(
+            player_speed_valid[frame_slice]
+        ).unsqueeze(0).to(device),
+        "team_features": torch.from_numpy(team_features[frame_slice]).unsqueeze(0).to(device),
+        "team_feature_valid": torch.from_numpy(
+            team_feature_valid[frame_slice]
+        ).unsqueeze(0).to(device),
+        "output_mask": output_mask,
+    }
+    with torch.no_grad():
+        logits = model(batch).squeeze(0)
+    if logits.shape != (segment.length,) or not torch.isfinite(logits).all():
+        raise ValueError("Model produced invalid segment logits")
+    probabilities = torch.sigmoid(logits).to(torch.float32).cpu().numpy()
+    if not np.isfinite(probabilities).all():
+        raise ValueError("Model produced non-finite probabilities")
+    return probabilities
 
 
 def validate_run_coverage(
@@ -584,6 +612,388 @@ def evaluate_inner_blocks(
     return report
 
 
+def load_metrica_features(path: str | Path) -> Dict[str, np.ndarray]:
+    """Load and fully validate the model-ready Metrica feature archive."""
+    from feature_engineering.metrica_features import validate_metrica_features
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Metrica feature archive not found: {path}")
+    with np.load(path, allow_pickle=False) as archive:
+        features = {name: archive[name] for name in archive.files}
+    validate_metrica_features(features)
+    return features
+
+
+def reconstruct_source_predictions(
+    probabilities_10hz: np.ndarray,
+    source_to_sample_index: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Map 10 Hz probabilities to the source timeline using the saved reverse index."""
+    probabilities_10hz = np.asarray(probabilities_10hz, dtype=np.float32)
+    source_to_sample_index = np.asarray(source_to_sample_index, dtype=np.int64)
+    if probabilities_10hz.ndim != 1 or not len(probabilities_10hz):
+        raise ValueError("10 Hz probabilities must be a non-empty 1D array")
+    if not np.isfinite(probabilities_10hz).all() or np.any(
+        (probabilities_10hz < 0.0) | (probabilities_10hz > 1.0)
+    ):
+        raise ValueError("10 Hz probabilities must be finite and lie in [0, 1]")
+    valid = source_to_sample_index >= 0
+    if np.any(source_to_sample_index[valid] >= len(probabilities_10hz)):
+        raise ValueError("Source alignment refers to a missing 10 Hz sample")
+
+    probabilities_25hz = np.zeros(len(source_to_sample_index), dtype=np.float32)
+    probabilities_25hz[valid] = probabilities_10hz[source_to_sample_index[valid]]
+    predictions_25hz = np.zeros(len(source_to_sample_index), dtype=np.int8)
+    predictions_25hz[valid] = (
+        probabilities_25hz[valid] >= THRESHOLD
+    ).astype(np.int8)
+    return probabilities_25hz, predictions_25hz, valid
+
+
+def average_fold_probabilities(
+    fold1: np.ndarray, fold2: np.ndarray
+) -> np.ndarray:
+    """Return the fixed equal-weight transfer ensemble."""
+    fold1 = np.asarray(fold1, dtype=np.float32)
+    fold2 = np.asarray(fold2, dtype=np.float32)
+    if fold1.ndim != 1 or fold1.shape != fold2.shape:
+        raise ValueError("Fold probabilities must be aligned 1D arrays")
+    if not np.isfinite(fold1).all() or not np.isfinite(fold2).all():
+        raise ValueError("Fold probabilities must be finite")
+    return (0.5 * fold1 + 0.5 * fold2).astype(np.float32)
+
+
+def validate_transfer_configs(
+    fold1: ExperimentConfig, fold2: ExperimentConfig
+) -> None:
+    """Reject fold checkpoints whose model architectures are not identical."""
+    if fold1.model != fold2.model:
+        raise ValueError("Fold checkpoints use incompatible model architectures")
+
+
+def _contiguous_segments(half_id: np.ndarray) -> tuple[Segment, ...]:
+    """Return one segment per Metrica half without permitting halftime context."""
+    half_id = np.asarray(half_id)
+    segments = []
+    for half in (1, 2):
+        indices = np.flatnonzero(half_id == half)
+        if not len(indices) or not np.array_equal(
+            indices, np.arange(indices[0], indices[-1] + 1)
+        ):
+            raise ValueError(f"Metrica half {half} must be one contiguous sequence")
+        segments.append(Segment(int(indices[0]), int(indices[-1] + 1), "test", half))
+    if sum(segment.length for segment in segments) != len(half_id):
+        raise ValueError("Metrica samples must belong to exactly one half")
+    return tuple(segments)
+
+
+def _infer_metrica_checkpoint(
+    path: str | Path,
+    fold: int,
+    model_type: str,
+    seed: int,
+    features: Mapping[str, np.ndarray],
+    device: torch.device,
+) -> tuple[np.ndarray, ExperimentConfig, Mapping[str, object]]:
+    """Apply one frozen WCSF refit checkpoint to both Metrica halves."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    config = validate_checkpoint(
+        checkpoint,
+        fold,
+        model_type,
+        seed,
+        expected_training_mode="full_half_refit",
+    )
+    source_fps = float(features["source_fps"])
+    if float(checkpoint.get("source_fps", source_fps)) != source_fps:
+        raise ValueError("Checkpoint and Metrica archive frequencies disagree")
+
+    normalizer = normalizer_from_state(checkpoint["normalizer"])
+    players, team_features = normalizer.transform(
+        features["players"],
+        features["player_location_valid"],
+        features["player_speed_valid"],
+        features["team_features"],
+        features["team_feature_valid"],
+    )
+    if not np.isfinite(players).all() or not np.isfinite(team_features).all():
+        raise ValueError("Normalization produced non-finite Metrica inputs")
+
+    model = build_model(config.model).to(device)
+    model.load_state_dict(checkpoint["model_state"], strict=True)
+    model.eval()
+    probabilities = np.empty(len(features["sample_index"]), dtype=np.float32)
+    coverage = np.zeros(len(probabilities), dtype=np.int8)
+    for segment in _contiguous_segments(features["half_id"]):
+        probabilities[segment.start : segment.end] = _predict_probabilities(
+            model,
+            players,
+            features["player_location_valid"],
+            features["player_speed_valid"],
+            team_features,
+            features["team_feature_valid"],
+            segment,
+            device,
+        )
+        coverage[segment.start : segment.end] += 1
+    if not np.all(coverage == 1) or not np.isfinite(probabilities).all():
+        raise ValueError("Metrica inference did not cover every 10 Hz sample exactly once")
+    return probabilities, config, checkpoint
+
+
+def _public_prediction_runs(
+    gt_binary: np.ndarray,
+    predictions: np.ndarray,
+    graded: np.ndarray,
+    source_half_id: np.ndarray,
+) -> tuple[PredictionRun, ...]:
+    """Create gap-aware runs for binary scoring on the public ground truth."""
+    if not (
+        gt_binary.shape == predictions.shape == graded.shape == source_half_id.shape
+    ):
+        raise ValueError("Ground truth, predictions, masks and half IDs must align")
+    edges = np.diff(np.r_[False, graded, False].astype(np.int8))
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    runs = []
+    for start, end in zip(starts, ends):
+        halves = np.unique(source_half_id[start:end])
+        if len(halves) != 1 or halves[0] not in (1, 2):
+            raise ValueError("A graded run cannot cross halftime or an unscored gap")
+        runs.append(
+            PredictionRun(
+                int(start),
+                int(end),
+                int(halves[0]),
+                gt_binary[start:end].astype(np.int8, copy=True),
+                predictions[start:end].astype(np.int8, copy=True),
+            )
+        )
+    if not runs:
+        raise ValueError("The Metrica ground truth contains no graded frames")
+    return tuple(runs)
+
+
+def _compact_transition_scores(scores: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in scores.items()
+        if key not in {"pairs", "missed", "spurious"}
+    }
+
+
+def official_binary_metrics(
+    gt_codes: np.ndarray, pred_binary: np.ndarray, prediction_valid: np.ndarray
+) -> Dict[str, object]:
+    """Reuse the official scorer for binary ALIVE/DEAD diagnostics."""
+    from evaluation import possession_metrics as pm
+
+    if not (gt_codes.shape == pred_binary.shape == prediction_valid.shape):
+        raise ValueError("Official metric inputs must have equal shapes")
+    pred_codes = np.full(len(gt_codes), pm.X, dtype=np.int8)
+    pred_codes[prediction_valid & (pred_binary == 1)] = pm.H
+    pred_codes[prediction_valid & (pred_binary == 0)] = pm.D
+    cm3 = pm.scored_confusion(pm.confusion(gt_codes, pred_codes))
+
+    collapsed_gt = gt_codes.copy()
+    collapsed_gt[collapsed_gt == pm.A] = pm.H
+    runs = pm.valid_runs(collapsed_gt)
+    filled_predictions = pm.fill_abstentions(pred_codes, runs)
+    gt_transitions = pm.transitions(collapsed_gt, runs)
+    pred_transitions = pm.transitions(filled_predictions, runs)
+    n_gt, n_pred, ratio = pm.fragmentation(
+        collapsed_gt, filled_predictions, runs
+    )
+    return {
+        "alive_dead_f1": float(pm.alive_dead_f1(cm3)),
+        "fragmentation": {
+            "n_ground_truth_segments": int(n_gt),
+            "n_predicted_segments": int(n_pred),
+            "ratio": float(ratio),
+        },
+        "transitions": {
+            str(tolerance): _compact_transition_scores(
+                pm.transition_scores(
+                    gt_transitions, pred_transitions, tolerance, typed="to"
+                )
+            )
+            for tolerance in pm.TAUS
+        },
+    }
+
+
+def _load_public_ground_truth(path: str | Path, n_frames: int) -> np.ndarray:
+    from evaluation import possession_metrics as pm
+
+    frame = pm.read_label_csv(path)
+    problem = pm.validate_submission(frame, n_frames)
+    if problem is not None:
+        raise ValueError(f"Invalid Metrica public ground truth: {problem}")
+    return pm.label_codes(frame)
+
+
+def _score_metrica_probabilities(
+    probabilities_10hz: np.ndarray,
+    features: Mapping[str, np.ndarray],
+    gt_codes: np.ndarray,
+) -> tuple[Dict[str, object], tuple[PredictionRun, ...], Dict[str, np.ndarray]]:
+    from evaluation import possession_metrics as pm
+
+    probabilities_25hz, predictions_25hz, prediction_valid = (
+        reconstruct_source_predictions(
+            probabilities_10hz, features["source_to_sample_index"]
+        )
+    )
+    graded = gt_codes != pm.X
+    if not np.all(prediction_valid[graded]):
+        raise ValueError("Not every public ground-truth frame has a prediction")
+    if int(graded.sum()) != 7500:
+        raise ValueError(f"Expected 7,500 public frames, found {int(graded.sum()):,}")
+    gt_binary = np.full(len(gt_codes), -1, dtype=np.int8)
+    gt_binary[(gt_codes == pm.H) | (gt_codes == pm.A)] = 1
+    gt_binary[gt_codes == pm.D] = 0
+    runs = _public_prediction_runs(
+        gt_binary, predictions_25hz, graded, features["source_half_id"]
+    )
+    metrics = score_prediction_runs(runs)
+    official = official_binary_metrics(gt_codes, predictions_25hz, prediction_valid)
+    alive_f1 = metrics["frame_metrics"]["per_class"]["ALIVE"]["f1"]
+    if not np.isclose(official["alive_dead_f1"], alive_f1, atol=1e-12):
+        raise ValueError("Official alive_dead_f1 disagrees with binary ALIVE F1")
+    return (
+        {**metrics, "official_binary_metrics": official},
+        runs,
+        {
+            "alive_probability_25hz": probabilities_25hz,
+            "alive_prediction_25hz": predictions_25hz,
+            "prediction_valid_25hz": prediction_valid,
+        },
+    )
+
+
+def evaluate_metrica_transfer(
+    model_type: str,
+    seed: int,
+    runs_dir: str | Path,
+    feature_path: str | Path,
+    ground_truth_path: str | Path,
+    device_name: str = "auto",
+) -> tuple[Dict[str, object], Dict[str, np.ndarray], tuple[PredictionRun, ...]]:
+    """Evaluate two frozen WCSF refit checkpoints on Metrica's public labels."""
+    features = load_metrica_features(feature_path)
+    device = select_device(device_name)
+    fold_probabilities: Dict[int, np.ndarray] = {}
+    configs: Dict[int, ExperimentConfig] = {}
+    checkpoints: Dict[int, Mapping[str, object]] = {}
+    paths: Dict[int, Path] = {}
+    for fold in (1, 2):
+        path = checkpoint_path(runs_dir, fold, model_type, seed)
+        probabilities, config, checkpoint = _infer_metrica_checkpoint(
+            path, fold, model_type, seed, features, device
+        )
+        fold_probabilities[fold] = probabilities
+        configs[fold] = config
+        checkpoints[fold] = checkpoint
+        paths[fold] = path
+    validate_transfer_configs(configs[1], configs[2])
+
+    ensemble_probabilities = average_fold_probabilities(
+        fold_probabilities[1], fold_probabilities[2]
+    )
+    gt_codes = _load_public_ground_truth(
+        ground_truth_path, int(features["original_frame_count"])
+    )
+    fold_reports = {}
+    for fold in (1, 2):
+        metrics, _, _ = _score_metrica_probabilities(
+            fold_probabilities[fold], features, gt_codes
+        )
+        fold_reports[str(fold)] = {
+            "checkpoint": str(paths[fold]),
+            "checkpoint_epoch": int(checkpoints[fold]["epoch"]),
+            **metrics,
+        }
+    ensemble_metrics, runs, reconstructed = _score_metrica_probabilities(
+        ensemble_probabilities, features, gt_codes
+    )
+    source_frames = np.flatnonzero(features["source_scored"])
+    selected_frames = features["source_frame_index"][
+        features["source_to_sample_index"][source_frames]
+    ]
+    full_max_alignment_frames = int(
+        np.max(np.abs(source_frames - selected_frames))
+    )
+    public_frames = np.flatnonzero(gt_codes != 3)
+    public_selected_frames = features["source_frame_index"][
+        features["source_to_sample_index"][public_frames]
+    ]
+    max_alignment_frames = int(
+        np.max(np.abs(public_frames - public_selected_frames))
+    )
+    if max_alignment_frames > 1:
+        raise ValueError(
+            "Public frames must map within one 25 Hz frame of a 10 Hz sample"
+        )
+
+    report: Dict[str, object] = {
+        "schema_version": "metrica_alive_dead_transfer_evaluation_v1",
+        "evaluation_type": "wcsf_to_metrica_public_transfer",
+        "model_type": model_type,
+        "seed": seed,
+        "classification_threshold": THRESHOLD,
+        "ensemble_weights": {"fold1": 0.5, "fold2": 0.5},
+        "class_order": ["DEAD", "ALIVE"],
+        "model_source_fps": float(features["source_fps"]),
+        "evaluation_source_fps": float(features["original_source_fps"]),
+        "feature_archive": str(feature_path),
+        "ground_truth": str(ground_truth_path),
+        "public_ground_truth_note": "H/A collapsed to ALIVE; D to DEAD; X ignored",
+        "alignment": {
+            "n_model_samples": int(len(features["sample_index"])),
+            "n_source_frames": int(features["original_frame_count"]),
+            "n_public_frames": int(sum(run.length for run in runs)),
+            "public_max_source_alignment_frames": max_alignment_frames,
+            "public_max_source_alignment_ms": float(
+                1000.0 * max_alignment_frames / float(features["original_source_fps"])
+            ),
+            "full_scored_max_source_alignment_frames": full_max_alignment_frames,
+            "full_scored_max_source_alignment_ms": float(
+                1000.0
+                * full_max_alignment_frames
+                / float(features["original_source_fps"])
+            ),
+        },
+        "fold_diagnostics": fold_reports,
+        "ensemble": ensemble_metrics,
+        "official_metric_scope": {
+            "reported": [
+                "alive_dead_f1",
+                "binary transition metrics",
+                "binary fragmentation",
+            ],
+            "not_reported": ["H/A/D macroF1", "H/A possession spellF1"],
+        },
+    }
+    predictions = {
+        "fold1_alive_probability_10hz": fold_probabilities[1].astype(np.float32),
+        "fold2_alive_probability_10hz": fold_probabilities[2].astype(np.float32),
+        "alive_probability_10hz": ensemble_probabilities,
+        "alive_prediction_10hz": (ensemble_probabilities >= THRESHOLD).astype(np.int8),
+        **reconstructed,
+        "sample_index": features["sample_index"],
+        "half_id": features["half_id"],
+        "timestamp_ms": features["timestamp_ms"],
+        "source_frame_index": features["source_frame_index"],
+        "source_to_sample_index": features["source_to_sample_index"],
+        "classification_threshold": np.array(THRESHOLD, dtype=np.float32),
+    }
+    return report, predictions, runs
+
+
 def _print_metrics(title: str, report: Mapping[str, object]) -> None:
     frame = report["frame_metrics"]
     segments = report["segment_metrics"]
@@ -604,6 +1014,9 @@ def _write_json(path: Path, report: Mapping[str, object]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dataset", default="wcsf", choices=("wcsf", "metrica")
+    )
     parser.add_argument("--fold", required=True, choices=("1", "2", "all"))
     parser.add_argument(
         "--model-type", required=True, choices=("team_tcn", "deepsets_tcn")
@@ -616,6 +1029,16 @@ def main() -> None:
     parser.add_argument(
         "--runs-dir", type=Path, default=Path("data/open_data_groningen/model_runs")
     )
+    parser.add_argument(
+        "--metrica-features",
+        type=Path,
+        default=Path("data/metrica/processed/metrica_player_team_features.npz"),
+    )
+    parser.add_argument(
+        "--metrica-ground-truth",
+        type=Path,
+        default=Path("evaluation/gt/BAR-ATH_possession_gt_public.csv"),
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--save-timeline",
@@ -623,6 +1046,49 @@ def main() -> None:
         help="Save ground-truth and prediction segment timelines",
     )
     args = parser.parse_args()
+
+    if args.dataset == "metrica":
+        if args.fold != "all":
+            parser.error("Metrica transfer evaluation requires --fold all")
+        if args.partition != "test" or args.inner_block is not None:
+            parser.error("Metrica transfer evaluation does not use WCSF partitions")
+        report, predictions, runs = evaluate_metrica_transfer(
+            args.model_type,
+            args.seed,
+            args.runs_dir,
+            args.metrica_features,
+            args.metrica_ground_truth,
+            args.device,
+        )
+        stem = f"metrica_{args.model_type}_seed{args.seed}_alive_dead"
+        report_path = args.runs_dir / f"{stem}_evaluation.json"
+        prediction_path = args.runs_dir / f"{stem}_predictions.npz"
+        timeline_path = args.runs_dir / f"{stem}_timeline.png"
+        _write_json(report_path, report)
+        np.savez_compressed(prediction_path, **predictions)
+        from .plotting import save_prediction_timeline
+
+        save_prediction_timeline(
+            runs,
+            float(report["evaluation_source_fps"]),
+            timeline_path,
+            f"Metrica public ALIVE/DEAD transfer: {args.model_type}",
+        )
+        for fold, result in report["fold_diagnostics"].items():
+            _print_metrics(f"Metrica transfer: Fold {fold} checkpoint", result)
+        _print_metrics("Metrica transfer: 50/50 ensemble", report["ensemble"])
+        official = report["ensemble"]["official_binary_metrics"]
+        print(f"  official alive/dead F1: {official['alive_dead_f1']:.4f}")
+        print(
+            "  binary fragmentation: "
+            f"{official['fragmentation']['n_predicted_segments']} predicted / "
+            f"{official['fragmentation']['n_ground_truth_segments']} ground truth"
+        )
+        print(f"Saved: {report_path}")
+        print(f"Saved: {prediction_path}")
+        print(f"Saved: {timeline_path}")
+        return
+
     timeline_jobs = []
 
     if args.fold == "all":

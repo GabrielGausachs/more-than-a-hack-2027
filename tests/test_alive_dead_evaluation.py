@@ -10,15 +10,19 @@ from modeling.alive_dead.config import ExperimentConfig
 from modeling.alive_dead.evaluate import (
     CheckpointEvaluation,
     PredictionRun,
+    average_fold_probabilities,
     combine_oof_runs,
     checkpoint_path,
     compute_frame_metrics,
     compute_segment_metrics,
     extract_segments,
     normalizer_from_state,
+    official_binary_metrics,
     inner_checkpoint_path,
+    reconstruct_source_predictions,
     validate_checkpoint,
     validate_run_coverage,
+    validate_transfer_configs,
 )
 from modeling.alive_dead.splits import build_fold_split
 
@@ -173,6 +177,40 @@ class CheckpointAndCoverageTests(unittest.TestCase):
         combined = combine_oof_runs(fold1, fold2)
         self.assertEqual([run.half_id for run in combined], [1, 2])
         self.assertEqual([run.start for run in combined], [0, 4])
+
+
+class MetricaTransferTests(unittest.TestCase):
+    def test_source_reconstruction_masks_unscored_frames(self):
+        probabilities, predictions, valid = reconstruct_source_predictions(
+            np.array([0.2, 0.5, 0.9], dtype=np.float32),
+            np.array([-1, 0, 0, 1, 2, -1], dtype=np.int64),
+        )
+        np.testing.assert_array_equal(valid, [False, True, True, True, True, False])
+        np.testing.assert_allclose(probabilities, [0.0, 0.2, 0.2, 0.5, 0.9, 0.0])
+        np.testing.assert_array_equal(predictions, [0, 0, 0, 1, 1, 0])
+
+    def test_fixed_fold_ensemble_is_equal_weight(self):
+        result = average_fold_probabilities(
+            np.array([0.0, 0.8], dtype=np.float32),
+            np.array([1.0, 0.4], dtype=np.float32),
+        )
+        np.testing.assert_allclose(result, [0.5, 0.6])
+
+    def test_public_x_is_excluded_from_official_alive_dead_f1(self):
+        # Official codes are H=0, A=1, D=2, X=3.
+        ground_truth = np.array([3, 0, 1, 2, 3], dtype=np.int8)
+        predictions = np.array([0, 1, 1, 0, 1], dtype=np.int8)
+        valid = np.ones(5, dtype=bool)
+        result = official_binary_metrics(ground_truth, predictions, valid)
+        self.assertAlmostEqual(result["alive_dead_f1"], 1.0)
+        self.assertEqual(result["fragmentation"]["n_ground_truth_segments"], 2)
+
+    def test_incompatible_fold_architectures_are_rejected(self):
+        fold1 = ExperimentConfig()
+        fold2 = ExperimentConfig()
+        fold2.model.kernel_size = 5
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            validate_transfer_configs(fold1, fold2)
 
 
 class RealCheckpointTests(unittest.TestCase):

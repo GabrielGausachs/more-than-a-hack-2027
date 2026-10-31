@@ -188,9 +188,32 @@ Individual reports are saved beside the checkpoint they evaluate. Combined repor
 `oof_<model_type>_seed<seed>.json` in the model-runs directory. Inner validation evaluation runs
 during cross-validation; outer train/test evaluation remains a separate explicit command.
 
+### Metrica transfer evaluation
+
+The same evaluator can apply both frozen WCSF refit checkpoints to the label-free Metrica 10 Hz
+features and score the public five-minute annotation at its original 25 Hz rate:
+
+```powershell
+python -m modeling.alive_dead.evaluate --dataset metrica --fold all --model-type deepsets_tcn --runs-dir data/open_data_groningen/model_runs/temporal_e_rf125_seq25
+```
+
+Each checkpoint uses its own saved WCSF normalizer; no statistics are fitted on Metrica. The two
+halves are inferred independently, and Fold 1/Fold 2 ALIVE probabilities are averaged with fixed
+equal weights. The saved source-to-sample index reconstructs a prediction for every scored 25 Hz
+frame without interpolation. Public `H` and `A` labels are collapsed to ALIVE, `D` to DEAD, and
+`X` is excluded from scoring.
+
+The report contains the binary frame and segment metrics used for WCSF, plus the competition
+scorer's exact `alive_dead_f1`, transition metrics at 12 and 25 frames, and binary-adapted
+fragmentation. Official H/A/D macro F1 and possession spell F1 are deliberately not reported,
+because an ALIVE/DEAD model does not predict the team in possession.
+
+The command saves one JSON report, one aligned prediction NPZ and one public-window timeline PNG
+in the selected runs directory. Invalid 25 Hz predictions outside the scored tracking intervals
+are zero-filled and must be interpreted through `prediction_valid_25hz`.
+
 ## Not implemented yet
 
 - Threshold selection or probability calibration.
-- Metrica feature transformation and inference.
 - Tracking degradation augmentation or domain adaptation.
 - H/A possession classification and final spell decoding.

@@ -474,12 +474,12 @@ def combine_oof_runs(
     return runs
 
 
-def evaluate_oof(
+def _evaluate_oof_with_runs(
     model_type: str,
     seed: int,
     runs_dir: str | Path,
     device_name: str = "auto",
-) -> Dict[str, object]:
+) -> tuple[Dict[str, object], tuple[PredictionRun, ...]]:
     fold1 = evaluate_checkpoint(
         checkpoint_path(runs_dir, 1, model_type, seed),
         1,
@@ -497,7 +497,7 @@ def evaluate_oof(
         device_name,
     )
     runs = combine_oof_runs(fold1, fold2)
-    return {
+    report = {
         "schema_version": "wcsf_alive_dead_evaluation_v2",
         "evaluation_type": "combined_oof",
         "model_type": model_type,
@@ -514,17 +514,29 @@ def evaluate_oof(
             **score_prediction_runs(runs),
         },
     }
+    return report, runs
 
 
-def evaluate_inner_blocks(
-    fold: int,
+def evaluate_oof(
     model_type: str,
     seed: int,
     runs_dir: str | Path,
     device_name: str = "auto",
 ) -> Dict[str, object]:
+    """Evaluate both held-out halves and return the combined OOF report."""
+    report, _ = _evaluate_oof_with_runs(model_type, seed, runs_dir, device_name)
+    return report
+
+
+def _evaluate_inner_blocks_with_runs(
+    fold: int,
+    model_type: str,
+    seed: int,
+    runs_dir: str | Path,
+    device_name: str = "auto",
+) -> tuple[Dict[str, object], Dict[str, CheckpointEvaluation]]:
     """Evaluate all three inner validation checkpoints without touching test data."""
-    evaluations = {}
+    evaluations: Dict[str, CheckpointEvaluation] = {}
     for block in (1, 2, 3):
         result = evaluate_checkpoint(
             inner_checkpoint_path(runs_dir, fold, model_type, seed, block),
@@ -536,25 +548,40 @@ def evaluate_inner_blocks(
             training_mode="inner_cv",
             validation_block=block,
         )
-        evaluations[str(block)] = result.report
-    return {
+        evaluations[str(block)] = result
+    report = {
         "schema_version": "wcsf_alive_dead_inner_cv_v1",
         "evaluation_type": "inner_validation_aggregate",
         "fold": fold,
         "model_type": model_type,
         "seed": seed,
-        "blocks": evaluations,
+        "blocks": {block: result.report for block, result in evaluations.items()},
         "mean_frame_macro_f1": float(
             np.mean(
-                [report["frame_metrics"]["macro_f1"] for report in evaluations.values()]
+                [result.report["frame_metrics"]["macro_f1"] for result in evaluations.values()]
             )
         ),
         "mean_binary_segment_f1": float(
             np.mean(
-                [report["segment_metrics"]["mean_f1"] for report in evaluations.values()]
+                [result.report["segment_metrics"]["mean_f1"] for result in evaluations.values()]
             )
         ),
     }
+    return report, evaluations
+
+
+def evaluate_inner_blocks(
+    fold: int,
+    model_type: str,
+    seed: int,
+    runs_dir: str | Path,
+    device_name: str = "auto",
+) -> Dict[str, object]:
+    """Evaluate all inner blocks and return their aggregate report."""
+    report, _ = _evaluate_inner_blocks_with_runs(
+        fold, model_type, seed, runs_dir, device_name
+    )
+    return report
 
 
 def _print_metrics(title: str, report: Mapping[str, object]) -> None:
@@ -590,14 +617,34 @@ def main() -> None:
         "--runs-dir", type=Path, default=Path("data/open_data_groningen/model_runs")
     )
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--save-timeline",
+        action="store_true",
+        help="Save ground-truth and prediction segment timelines",
+    )
     args = parser.parse_args()
+    timeline_jobs = []
 
     if args.fold == "all":
         if args.inner_block is not None:
             parser.error("--fold all cannot be combined with --inner-block")
         if args.partition != "test":
             parser.error("--fold all only supports the held-out test partition")
-        report = evaluate_oof(args.model_type, args.seed, args.runs_dir, args.device)
+        if args.save_timeline:
+            report, runs = _evaluate_oof_with_runs(
+                args.model_type, args.seed, args.runs_dir, args.device
+            )
+            timeline_jobs.append(
+                (
+                    runs,
+                    float(report["source_fps"]),
+                    args.runs_dir
+                    / f"oof_{args.model_type}_seed{args.seed}_timeline.png",
+                    f"Combined OOF: {args.model_type}",
+                )
+            )
+        else:
+            report = evaluate_oof(args.model_type, args.seed, args.runs_dir, args.device)
         _print_metrics("Fold 1 held-out test", report["fold_results"]["1"])
         _print_metrics("Fold 2 held-out test", report["fold_results"]["2"])
         _print_metrics("Combined out-of-fold", report["combined"])
@@ -608,9 +655,23 @@ def main() -> None:
             if args.partition != "validation":
                 parser.error("--inner-block only supports --partition validation")
             if args.inner_block == "all":
-                report = evaluate_inner_blocks(
-                    fold, args.model_type, args.seed, args.runs_dir, args.device
-                )
+                if args.save_timeline:
+                    report, block_evaluations = _evaluate_inner_blocks_with_runs(
+                        fold, args.model_type, args.seed, args.runs_dir, args.device
+                    )
+                    for block, result in block_evaluations.items():
+                        timeline_jobs.append(
+                            (
+                                result.runs,
+                                result.source_fps,
+                                result.checkpoint_path.parent / "timeline_validation.png",
+                                f"Fold {fold} inner block {block} validation: {args.model_type}",
+                            )
+                        )
+                else:
+                    report = evaluate_inner_blocks(
+                        fold, args.model_type, args.seed, args.runs_dir, args.device
+                    )
                 for block, block_report in report["blocks"].items():
                     _print_metrics(f"Fold {fold} inner block {block}", block_report)
                 output_path = (
@@ -633,6 +694,15 @@ def main() -> None:
                     validation_block=block,
                 )
                 report = evaluation.report
+                if args.save_timeline:
+                    timeline_jobs.append(
+                        (
+                            evaluation.runs,
+                            evaluation.source_fps,
+                            evaluation.checkpoint_path.parent / "timeline_validation.png",
+                            f"Fold {fold} inner block {block} validation: {args.model_type}",
+                        )
+                    )
                 _print_metrics(f"Fold {fold} inner block {block}", report)
                 output_path = (
                     evaluation.checkpoint_path.parent / "evaluation_validation.json"
@@ -649,6 +719,16 @@ def main() -> None:
                 args.device,
             )
             report = evaluation.report
+            if args.save_timeline:
+                timeline_jobs.append(
+                    (
+                        evaluation.runs,
+                        evaluation.source_fps,
+                        evaluation.checkpoint_path.parent
+                        / f"timeline_{args.partition}.png",
+                        f"Fold {fold} {args.partition}: {args.model_type}",
+                    )
+                )
             _print_metrics(f"Fold {fold} refit {args.partition}", report)
             output_path = (
                 evaluation.checkpoint_path.parent / f"evaluation_{args.partition}.json"
@@ -656,6 +736,14 @@ def main() -> None:
 
     _write_json(output_path, report)
     print(f"Saved: {output_path}")
+    if timeline_jobs:
+        from .plotting import save_prediction_timeline
+
+        for runs, source_fps, timeline_path, title in timeline_jobs:
+            saved_path = save_prediction_timeline(
+                runs, source_fps, timeline_path, title
+            )
+            print(f"Saved: {saved_path}")
 
 
 if __name__ == "__main__":

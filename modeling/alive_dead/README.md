@@ -163,6 +163,17 @@ python -m modeling.alive_dead.evaluate --fold all --model-type deepsets_tcn
 The combined out-of-fold result uses Fold 2 to predict the first half and Fold 1 to predict the
 second half. Every scored frame therefore comes from a model that did not train on that half.
 
+Add `--save-timeline` to any evaluation command to save a diagnostic PNG with aligned ground-truth
+and prediction segments. For combined OOF evaluation, the first half is shown above the second:
+
+```powershell
+python -m modeling.alive_dead.evaluate --fold all --model-type deepsets_tcn --save-timeline
+```
+
+The combined figure is saved as `oof_<model_type>_seed<seed>_timeline.png` in the selected
+model-runs directory. Single-fold figures are saved beside the checkpoint they evaluate. Blank
+timeline areas indicate disconnected or excluded intervals and are never joined artificially.
+
 Predictions use a fixed threshold of `sigmoid(logit) >= 0.5`. Reports contain accuracy, binary
 confusion matrix, per-class precision/recall/F1 and macro F1. Confusion-matrix rows are ground
 truth, columns are predictions, and the class order is `DEAD`, `ALIVE`.

@@ -12,9 +12,16 @@ import numpy as np
 import torch
 
 from .config import ExperimentConfig
-from .dataset import WCSFData, load_wcsf_data
+from .dataset import WCSFData, load_wcsf_data, normalize_wcsf_data
+from .inference import predict_segment_logits
 from .preprocessing import FeatureNormalizer
-from .splits import FoldSplit, Segment, build_fold_split, build_refit_split
+from .splits import (
+    FoldSplit,
+    Segment,
+    build_fold_split,
+    build_refit_split,
+    valid_subsegments,
+)
 from .tcn import build_model
 
 
@@ -66,6 +73,7 @@ class CheckpointEvaluation:
     source_fps: float
     runs: tuple[PredictionRun, ...]
     report: Dict[str, object]
+    label_valid: np.ndarray | None = None
 
 
 def _safe_ratio(numerator: int, denominator: int) -> float:
@@ -267,37 +275,19 @@ def validate_checkpoint(
         "validation_block"
     ) is not None:
         raise ValueError("A refit checkpoint cannot contain a validation block")
-    config.validate(float(checkpoint.get("source_fps", 10.0)))
+    # Historical checkpoints may use window strides that are no longer valid for
+    # center-only training; inference does not depend on the training stride.
+    config.validate(
+        float(checkpoint.get("source_fps", 10.0)), require_supervised_coverage=False
+    )
     normalizer_from_state(checkpoint["normalizer"])
     return config
 
 
-def _normalized_data(raw: WCSFData, normalizer: FeatureNormalizer) -> WCSFData:
-    players, team_features = normalizer.transform(
-        raw.players,
-        raw.player_location_valid,
-        raw.player_speed_valid,
-        raw.team_features,
-        raw.team_feature_valid,
-    )
-    return WCSFData(
-        players=players,
-        player_location_valid=raw.player_location_valid,
-        player_speed_valid=raw.player_speed_valid,
-        team_features=team_features,
-        team_feature_valid=raw.team_feature_valid,
-        labels=raw.labels,
-        timestamp_ms=raw.timestamp_ms,
-        half_id=raw.half_id,
-        sample_index=raw.sample_index,
-        source_fps=raw.source_fps,
-    )
-
-
-def _predict_segment(
+def _predict_valid_runs(
     model: torch.nn.Module, data: WCSFData, segment: Segment, device: torch.device
-) -> PredictionRun:
-    frame_slice = slice(segment.start, segment.end)
+) -> tuple[PredictionRun, ...]:
+    """Infer with full context, then split scoring at ambiguous-label gaps."""
     probabilities = _predict_probabilities(
         model,
         data.players,
@@ -309,12 +299,17 @@ def _predict_segment(
         device,
     )
     predictions = (probabilities >= THRESHOLD).astype(np.int8)
-    return PredictionRun(
-        segment.start,
-        segment.end,
-        segment.half_id,
-        data.labels[frame_slice].copy(),
-        predictions,
+    return tuple(
+        PredictionRun(
+            valid_segment.start,
+            valid_segment.end,
+            valid_segment.half_id,
+            data.labels[valid_segment.start : valid_segment.end].copy(),
+            predictions[
+                valid_segment.start - segment.start : valid_segment.end - segment.start
+            ].copy(),
+        )
+        for valid_segment in valid_subsegments(segment, data.label_valid)
     )
 
 
@@ -329,24 +324,16 @@ def _predict_probabilities(
     device: torch.device,
 ) -> np.ndarray:
     """Infer one genuinely contiguous segment and return ALIVE probabilities."""
-    frame_slice = slice(segment.start, segment.end)
-    output_mask = torch.ones((1, segment.length), dtype=torch.bool, device=device)
-    batch = {
-        "players": torch.from_numpy(players[frame_slice]).unsqueeze(0).to(device),
-        "player_location_valid": torch.from_numpy(
-            player_location_valid[frame_slice]
-        ).unsqueeze(0).to(device),
-        "player_speed_valid": torch.from_numpy(
-            player_speed_valid[frame_slice]
-        ).unsqueeze(0).to(device),
-        "team_features": torch.from_numpy(team_features[frame_slice]).unsqueeze(0).to(device),
-        "team_feature_valid": torch.from_numpy(
-            team_feature_valid[frame_slice]
-        ).unsqueeze(0).to(device),
-        "output_mask": output_mask,
-    }
-    with torch.no_grad():
-        logits = model(batch).squeeze(0)
+    logits = predict_segment_logits(
+        model,
+        players,
+        player_location_valid,
+        player_speed_valid,
+        team_features,
+        team_feature_valid,
+        segment,
+        device,
+    )
     if logits.shape != (segment.length,) or not torch.isfinite(logits).all():
         raise ValueError("Model produced invalid segment logits")
     probabilities = torch.sigmoid(logits).to(torch.float32).cpu().numpy()
@@ -356,9 +343,14 @@ def _predict_probabilities(
 
 
 def validate_run_coverage(
-    runs: Sequence[PredictionRun], split: FoldSplit, partition: str, n_frames: int
+    runs: Sequence[PredictionRun], split: FoldSplit, partition: str, n_frames: int,
+    label_valid: np.ndarray | None = None,
 ) -> None:
-    expected = getattr(split, f"{partition}_mask")
+    expected = getattr(split, f"{partition}_mask").copy()
+    if label_valid is not None:
+        if label_valid.shape != (n_frames,) or label_valid.dtype != np.bool_:
+            raise ValueError("label_valid must be a Boolean full-timeline mask")
+        expected &= label_valid
     coverage = np.zeros(n_frames, dtype=np.int8)
     for run in runs:
         if run.start < 0 or run.end > n_frames or run.start >= run.end:
@@ -368,21 +360,27 @@ def validate_run_coverage(
         raise ValueError(f"Predictions do not exactly cover the {partition} partition")
 
 
-def checkpoint_path(runs_dir: str | Path, fold: int, model_type: str, seed: int) -> Path:
+def checkpoint_path(
+    runs_dir: str | Path, fold: int, model_type: str, seed: int,
+    strict_labels: bool = False,
+) -> Path:
+    suffix = "_strict" if strict_labels else ""
     return (
         Path(runs_dir)
-        / f"fold{fold}_{model_type}_seed{seed}"
+        / f"fold{fold}_{model_type}{suffix}_seed{seed}"
         / "refit"
         / "final_checkpoint.pt"
     )
 
 
 def inner_checkpoint_path(
-    runs_dir: str | Path, fold: int, model_type: str, seed: int, validation_block: int
+    runs_dir: str | Path, fold: int, model_type: str, seed: int, validation_block: int,
+    strict_labels: bool = False,
 ) -> Path:
+    suffix = "_strict" if strict_labels else ""
     return (
         Path(runs_dir)
-        / f"fold{fold}_{model_type}_seed{seed}"
+        / f"fold{fold}_{model_type}{suffix}_seed{seed}"
         / f"inner_block{validation_block}"
         / "best_checkpoint.pt"
     )
@@ -419,7 +417,11 @@ def evaluate_checkpoint(
         training_mode,
         validation_block,
     )
-    raw = load_wcsf_data(config.data.feature_path, config.data.label_path)
+    if config.model.classification_mode != "binary":
+        raise ValueError("The binary evaluator requires classification_mode='binary'")
+    raw = load_wcsf_data(
+        config.data.feature_path, config.data.label_path, "binary"
+    )
     if float(checkpoint.get("source_fps", raw.source_fps)) != raw.source_fps:
         raise ValueError("Checkpoint and feature archive source frequencies disagree")
     if training_mode == "full_half_refit":
@@ -433,16 +435,21 @@ def evaluate_checkpoint(
             buffer_frames,
             int(validation_block),
         )
-    data = _normalized_data(raw, normalizer_from_state(checkpoint["normalizer"]))
+    data = normalize_wcsf_data(
+        raw, normalizer_from_state(checkpoint["normalizer"])
+    )
     device = select_device(device_name)
     model = build_model(config.model).to(device)
     model.load_state_dict(checkpoint["model_state"], strict=True)
     model.eval()
     runs = tuple(
-        _predict_segment(model, data, segment, device)
+        run
         for segment in split.segments[partition]
+        for run in _predict_valid_runs(model, data, segment, device)
     )
-    validate_run_coverage(runs, split, partition, raw.n_frames)
+    validate_run_coverage(
+        runs, split, partition, raw.n_frames, raw.label_valid
+    )
     metrics = score_prediction_runs(runs)
     report: Dict[str, object] = {
         "schema_version": "wcsf_alive_dead_evaluation_v2",
@@ -458,6 +465,9 @@ def evaluate_checkpoint(
         "classification_threshold": THRESHOLD,
         "class_order": ["DEAD", "ALIVE"],
         "source_fps": raw.source_fps,
+        "n_invalid_labels_in_partition": int(
+            np.count_nonzero(getattr(split, f"{partition}_mask") & ~raw.label_valid)
+        ),
         "runs": [
             {"start": run.start, "end": run.end, "half_id": run.half_id}
             for run in runs
@@ -473,6 +483,7 @@ def evaluate_checkpoint(
         raw.source_fps,
         runs,
         report,
+        raw.label_valid.copy(),
     )
 
 
@@ -497,8 +508,13 @@ def combine_oof_runs(
     coverage = np.zeros(fold1.n_frames_total, dtype=np.int8)
     for run in runs:
         coverage[run.start : run.end] += 1
-    if not np.all(coverage == 1):
-        raise ValueError("Combined OOF predictions must cover every frame exactly once")
+    validity = fold1.label_valid
+    if validity is None:
+        validity = np.ones(fold1.n_frames_total, dtype=bool)
+    if fold2.label_valid is not None and not np.array_equal(validity, fold2.label_valid):
+        raise ValueError("OOF checkpoints use incompatible label-validity masks")
+    if not np.array_equal(coverage, validity.astype(np.int8)):
+        raise ValueError("Combined OOF predictions must cover every valid frame exactly once")
     return runs
 
 
@@ -507,9 +523,10 @@ def _evaluate_oof_with_runs(
     seed: int,
     runs_dir: str | Path,
     device_name: str = "auto",
+    strict_labels: bool = False,
 ) -> tuple[Dict[str, object], tuple[PredictionRun, ...]]:
     fold1 = evaluate_checkpoint(
-        checkpoint_path(runs_dir, 1, model_type, seed),
+        checkpoint_path(runs_dir, 1, model_type, seed, strict_labels),
         1,
         model_type,
         seed,
@@ -517,7 +534,7 @@ def _evaluate_oof_with_runs(
         device_name,
     )
     fold2 = evaluate_checkpoint(
-        checkpoint_path(runs_dir, 2, model_type, seed),
+        checkpoint_path(runs_dir, 2, model_type, seed, strict_labels),
         2,
         model_type,
         seed,
@@ -550,9 +567,12 @@ def evaluate_oof(
     seed: int,
     runs_dir: str | Path,
     device_name: str = "auto",
+    strict_labels: bool = False,
 ) -> Dict[str, object]:
     """Evaluate both held-out halves and return the combined OOF report."""
-    report, _ = _evaluate_oof_with_runs(model_type, seed, runs_dir, device_name)
+    report, _ = _evaluate_oof_with_runs(
+        model_type, seed, runs_dir, device_name, strict_labels
+    )
     return report
 
 
@@ -562,12 +582,15 @@ def _evaluate_inner_blocks_with_runs(
     seed: int,
     runs_dir: str | Path,
     device_name: str = "auto",
+    strict_labels: bool = False,
 ) -> tuple[Dict[str, object], Dict[str, CheckpointEvaluation]]:
     """Evaluate all three inner validation checkpoints without touching test data."""
     evaluations: Dict[str, CheckpointEvaluation] = {}
     for block in (1, 2, 3):
         result = evaluate_checkpoint(
-            inner_checkpoint_path(runs_dir, fold, model_type, seed, block),
+            inner_checkpoint_path(
+                runs_dir, fold, model_type, seed, block, strict_labels
+            ),
             fold,
             model_type,
             seed,
@@ -604,10 +627,11 @@ def evaluate_inner_blocks(
     seed: int,
     runs_dir: str | Path,
     device_name: str = "auto",
+    strict_labels: bool = False,
 ) -> Dict[str, object]:
     """Evaluate all inner blocks and return their aggregate report."""
     report, _ = _evaluate_inner_blocks_with_runs(
-        fold, model_type, seed, runs_dir, device_name
+        fold, model_type, seed, runs_dir, device_name, strict_labels
     )
     return report
 
@@ -1041,6 +1065,12 @@ def main() -> None:
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument(
+        "--label-policy",
+        choices=("strict", "legacy"),
+        default="strict",
+        help="WCSF binary checkpoint family; Metrica transfer always uses legacy runs",
+    )
+    parser.add_argument(
         "--save-timeline",
         action="store_true",
         help="Save ground-truth and prediction segment timelines",
@@ -1090,6 +1120,8 @@ def main() -> None:
         return
 
     timeline_jobs = []
+    strict_labels = args.label_policy == "strict"
+    family_suffix = "_strict" if strict_labels else ""
 
     if args.fold == "all":
         if args.inner_block is not None:
@@ -1098,23 +1130,25 @@ def main() -> None:
             parser.error("--fold all only supports the held-out test partition")
         if args.save_timeline:
             report, runs = _evaluate_oof_with_runs(
-                args.model_type, args.seed, args.runs_dir, args.device
+                args.model_type, args.seed, args.runs_dir, args.device, strict_labels
             )
             timeline_jobs.append(
                 (
                     runs,
                     float(report["source_fps"]),
                     args.runs_dir
-                    / f"oof_{args.model_type}_seed{args.seed}_timeline.png",
+                    / f"oof_{args.model_type}{family_suffix}_seed{args.seed}_timeline.png",
                     f"Combined OOF: {args.model_type}",
                 )
             )
         else:
-            report = evaluate_oof(args.model_type, args.seed, args.runs_dir, args.device)
+            report = evaluate_oof(
+                args.model_type, args.seed, args.runs_dir, args.device, strict_labels
+            )
         _print_metrics("Fold 1 held-out test", report["fold_results"]["1"])
         _print_metrics("Fold 2 held-out test", report["fold_results"]["2"])
         _print_metrics("Combined out-of-fold", report["combined"])
-        output_path = args.runs_dir / f"oof_{args.model_type}_seed{args.seed}.json"
+        output_path = args.runs_dir / f"oof_{args.model_type}{family_suffix}_seed{args.seed}.json"
     else:
         fold = int(args.fold)
         if args.inner_block is not None:
@@ -1123,7 +1157,8 @@ def main() -> None:
             if args.inner_block == "all":
                 if args.save_timeline:
                     report, block_evaluations = _evaluate_inner_blocks_with_runs(
-                        fold, args.model_type, args.seed, args.runs_dir, args.device
+                        fold, args.model_type, args.seed, args.runs_dir, args.device,
+                        strict_labels,
                     )
                     for block, result in block_evaluations.items():
                         timeline_jobs.append(
@@ -1136,20 +1171,22 @@ def main() -> None:
                         )
                 else:
                     report = evaluate_inner_blocks(
-                        fold, args.model_type, args.seed, args.runs_dir, args.device
+                        fold, args.model_type, args.seed, args.runs_dir, args.device,
+                        strict_labels,
                     )
                 for block, block_report in report["blocks"].items():
                     _print_metrics(f"Fold {fold} inner block {block}", block_report)
                 output_path = (
                     args.runs_dir
-                    / f"fold{fold}_{args.model_type}_seed{args.seed}"
+                    / f"fold{fold}_{args.model_type}{family_suffix}_seed{args.seed}"
                     / "evaluation_inner_validation.json"
                 )
             else:
                 block = int(args.inner_block)
                 evaluation = evaluate_checkpoint(
                     inner_checkpoint_path(
-                        args.runs_dir, fold, args.model_type, args.seed, block
+                        args.runs_dir, fold, args.model_type, args.seed, block,
+                        strict_labels,
                     ),
                     fold,
                     args.model_type,
@@ -1177,7 +1214,9 @@ def main() -> None:
             if args.partition == "validation":
                 parser.error("Refit models have no validation partition; use --inner-block")
             evaluation = evaluate_checkpoint(
-                checkpoint_path(args.runs_dir, fold, args.model_type, args.seed),
+                checkpoint_path(
+                    args.runs_dir, fold, args.model_type, args.seed, strict_labels
+                ),
                 fold,
                 args.model_type,
                 args.seed,

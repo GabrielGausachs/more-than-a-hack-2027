@@ -146,7 +146,8 @@ class BaseAliveDeadTCN(nn.Module):
             config.dropout,
             config.convolutions_per_block,
         )
-        self.classifier = nn.Linear(config.temporal_channels, 1)
+        self.output_classes = config.output_classes
+        self.classifier = nn.Linear(config.temporal_channels, self.output_classes)
 
     def temporal_forward(
         self, representation: torch.Tensor, output_mask: torch.Tensor
@@ -154,7 +155,8 @@ class BaseAliveDeadTCN(nn.Module):
         projected = self.input_projection(representation)
         projected = projected * output_mask.unsqueeze(-1).to(projected.dtype)
         temporal = self.temporal(projected.transpose(1, 2), output_mask)
-        return self.classifier(temporal.transpose(1, 2)).squeeze(-1)
+        logits = self.classifier(temporal.transpose(1, 2))
+        return logits.squeeze(-1) if self.output_classes == 1 else logits
 
 
 class TeamStatisticsTCN(BaseAliveDeadTCN):

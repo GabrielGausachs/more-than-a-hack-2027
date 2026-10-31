@@ -60,6 +60,25 @@ def _half_segment(half_id: np.ndarray, half: int, partition: str) -> Segment:
     return Segment(int(indices[0]), int(indices[-1] + 1), partition, half)
 
 
+def valid_subsegments(segment: Segment, valid: np.ndarray) -> Tuple[Segment, ...]:
+    """Split one segment at invalid-label gaps without changing its half."""
+    if valid.ndim != 1 or valid.dtype != np.bool_ or segment.end > len(valid):
+        raise ValueError("valid must be a full-timeline Boolean mask")
+    local = valid[segment.start : segment.end]
+    edges = np.diff(np.r_[False, local, False].astype(np.int8))
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    return tuple(
+        Segment(
+            segment.start + int(start),
+            segment.start + int(end),
+            segment.partition,
+            segment.half_id,
+        )
+        for start, end in zip(starts, ends)
+    )
+
+
 def build_fold_split(
     half_id: np.ndarray,
     fold: int,

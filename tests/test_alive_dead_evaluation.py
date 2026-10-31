@@ -128,6 +128,10 @@ class CheckpointAndCoverageTests(unittest.TestCase):
             inner_checkpoint_path(root, 1, "team_tcn", 42, 3),
             root / "fold1_team_tcn_seed42/inner_block3/best_checkpoint.pt",
         )
+        self.assertEqual(
+            checkpoint_path(root, 1, "team_tcn", 42, strict_labels=True),
+            root / "fold1_team_tcn_strict_seed42/refit/final_checkpoint.pt",
+        )
 
     def test_training_mode_and_block_mismatch_are_rejected(self):
         checkpoint = self._checkpoint()
@@ -151,6 +155,17 @@ class CheckpointAndCoverageTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "exactly cover"):
             validate_run_coverage([incomplete], split, "test", len(half_id))
+
+    def test_invalid_labels_are_excluded_from_required_coverage(self):
+        half_id = np.r_[np.ones(20, dtype=np.int8), np.full(20, 2, dtype=np.int8)]
+        split = build_fold_split(half_id, fold=1, validation_fraction=0.2, buffer_frames=2)
+        valid = np.ones(40, dtype=bool)
+        valid[25] = False
+        runs = [
+            prediction_run(20, np.zeros(5, dtype=np.int8), half_id=2),
+            prediction_run(26, np.zeros(14, dtype=np.int8), half_id=2),
+        ]
+        validate_run_coverage(runs, split, "test", len(half_id), valid)
 
     def test_oof_mapping_uses_fold2_for_h1_and_fold1_for_h2(self):
         fold1_run = prediction_run(4, [0, 1, 0, 1], half_id=2)

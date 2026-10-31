@@ -16,11 +16,16 @@ from modeling.alive_dead.dataset import (
     build_dataloaders,
     load_wcsf_data,
 )
+from modeling.alive_dead.inference import predict_segment_logits
 from modeling.alive_dead.player_encoder import DeepSetPlayerEncoder
 from modeling.alive_dead.preprocessing import FeatureNormalizer
 from modeling.alive_dead.splits import Segment, build_fold_split, build_refit_split
 from modeling.alive_dead.tcn import build_model
-from modeling.alive_dead.train import masked_bce_components
+from modeling.alive_dead.train import (
+    masked_bce_components,
+    masked_cross_entropy_components,
+    validate_full_segments,
+)
 from modeling.alive_dead.train import run_cross_validation
 
 
@@ -102,21 +107,47 @@ class SplitTests(unittest.TestCase):
 
 
 class DatasetAndNormalizationTests(unittest.TestCase):
-    def test_windows_do_not_cross_segments_and_weights_sum_to_one(self):
-        data = synthetic_data(24)
-        segments = (Segment(0, 7, "train", 1), Segment(12, 24, "train", 2))
-        dataset = TemporalWindowDataset(data, segments, sequence_frames=6, stride_frames=3)
-        reconstructed_weight = np.zeros(24, dtype=np.float32)
-        for item in dataset:
-            indices = item["global_index"].numpy()
-            mask = item["output_mask"].numpy()
-            valid_indices = indices[mask]
-            self.assertTrue(np.all(np.diff(valid_indices) == 1))
-            self.assertFalse(np.any((valid_indices >= 7) & (valid_indices < 12)))
-            reconstructed_weight[valid_indices] += item["loss_weight"].numpy()[mask]
-        np.testing.assert_allclose(reconstructed_weight[:7], 1.0)
-        np.testing.assert_allclose(reconstructed_weight[12:], 1.0)
-        np.testing.assert_allclose(reconstructed_weight[7:12], 0.0)
+    def test_center_supervision_covers_every_frame_once_after_weighting(self):
+        data = synthetic_data(80)
+        segment = Segment(5, 75, "train", 1)
+        dataset = TemporalWindowDataset(
+            data,
+            (segment,),
+            sequence_frames=20,
+            stride_frames=5,
+            context_radius=6,
+        )
+        weighted_coverage = np.zeros(data.n_frames, dtype=np.float32)
+        raw_coverage = np.zeros(data.n_frames, dtype=np.int32)
+        for window, item in zip(dataset.windows, dataset):
+            supervised = item["supervision_mask"].numpy()
+            selected = window.start + np.flatnonzero(supervised)
+            raw_coverage[selected] += 1
+            weighted_coverage[selected] += item["loss_weight"].numpy()[supervised]
+            self.assertGreaterEqual(int(selected.min()), segment.start)
+            self.assertLess(int(selected.max()), segment.end)
+        first = dataset[0]["supervision_mask"].numpy()
+        middle = dataset[1]["supervision_mask"].numpy()
+        last = dataset[len(dataset) - 1]["supervision_mask"].numpy()
+        self.assertTrue(first[:14].all())
+        self.assertFalse(middle[:6].any())
+        self.assertFalse(middle[14:].any())
+        self.assertTrue(last[6:20].all())
+        self.assertTrue((raw_coverage[segment.start : segment.end] > 0).all())
+        np.testing.assert_allclose(weighted_coverage[segment.start : segment.end], 1.0)
+        self.assertFalse(raw_coverage[: segment.start].any())
+        self.assertFalse(raw_coverage[segment.end :].any())
+
+    def test_invalid_label_is_context_but_not_supervision(self):
+        data = synthetic_data(8)
+        valid = np.ones(8, dtype=bool)
+        valid[3] = False
+        data = WCSFData(**{**data.__dict__, "labels": np.where(valid, data.labels, -1).astype(np.int8), "label_valid": valid})
+        item = TemporalWindowDataset(
+            data, (Segment(0, 8, "train", 1),), 8, 6, 1
+        )[0]
+        self.assertTrue(item["output_mask"][3])
+        self.assertFalse(item["label_valid"][3])
 
     def test_normalizer_uses_training_frames_and_preserves_discrete_features(self):
         data = synthetic_data(24)
@@ -154,6 +185,7 @@ class ModelTests(unittest.TestCase):
             "team_feature_valid": torch.ones(batch_size, length, 2, 6, dtype=torch.bool),
             "output_mask": torch.ones(batch_size, length, dtype=torch.bool),
             "labels": torch.randint(0, 2, (batch_size, length), dtype=torch.float32),
+            "label_valid": torch.ones(batch_size, length, dtype=torch.bool),
             "loss_weight": torch.ones(batch_size, length),
         }
 
@@ -183,9 +215,59 @@ class ModelTests(unittest.TestCase):
                 self.assertEqual(logits.shape, batch["labels"].shape)
                 self.assertTrue(torch.isfinite(logits).all())
                 numerator, denominator = masked_bce_components(
-                    logits, batch["labels"], batch["output_mask"], batch["loss_weight"]
+                    logits,
+                    batch["labels"],
+                    batch["output_mask"],
+                    batch["loss_weight"],
+                    batch["label_valid"],
                 )
                 self.assertTrue(torch.isfinite(numerator / denominator))
+
+    def test_had_models_produce_three_logits_and_masked_ce(self):
+        batch = self._batch()
+        batch["labels"] = torch.randint(0, 3, batch["labels"].shape).float()
+        batch["label_valid"] = torch.ones_like(batch["output_mask"])
+        batch["labels"][0, 4] = -1
+        batch["label_valid"][0, 4] = False
+        for model_type in ("team_tcn", "deepsets_tcn"):
+            model = build_model(
+                ModelConfig(model_type=model_type, classification_mode="had")
+            ).eval()
+            logits = model(batch)
+            self.assertEqual(logits.shape, (*batch["labels"].shape, 3))
+            numerator, denominator = masked_cross_entropy_components(
+                logits,
+                batch["labels"],
+                batch["output_mask"],
+                batch["loss_weight"],
+                batch["label_valid"],
+            )
+            self.assertTrue(torch.isfinite(numerator / denominator))
+
+    def test_invalid_targets_contribute_no_loss_or_gradient(self):
+        logits = torch.tensor(
+            [[[1.0, 0.0, -1.0], [0.0, 1.0, -1.0]]], requires_grad=True
+        )
+        labels = torch.tensor([[0.0, -1.0]])
+        mask = torch.tensor([[True, True]])
+        valid = torch.tensor([[True, False]])
+        numerator, denominator = masked_cross_entropy_components(
+            logits, labels, mask, torch.ones_like(labels), valid
+        )
+        (numerator / denominator).backward()
+        torch.testing.assert_close(logits.grad[:, 1], torch.zeros_like(logits.grad[:, 1]))
+
+        binary_logits = torch.tensor([[0.0, 1.0]], requires_grad=True)
+        binary_labels = torch.tensor([[1.0, -1.0]])
+        numerator, denominator = masked_bce_components(
+            binary_logits,
+            binary_labels,
+            mask,
+            torch.ones_like(binary_labels),
+            valid,
+        )
+        (numerator / denominator).backward()
+        self.assertEqual(float(binary_logits.grad[0, 1]), 0.0)
 
     def test_default_receptive_field_and_unsafe_configuration(self):
         config = ExperimentConfig()
@@ -194,6 +276,20 @@ class ModelTests(unittest.TestCase):
         config.model.dilations = (1, 2, 4, 8, 16, 32)
         with self.assertRaisesRegex(ValueError, "receptive field"):
             config.validate(10.0)
+
+    def test_configuration_d_context_geometry(self):
+        config = ExperimentConfig.from_json(
+            Path(__file__).resolve().parents[1]
+            / "configs/alive_dead/temporal_d_rf125_seq20.json"
+        )
+        self.assertEqual(config.model.receptive_field_frames, 125)
+        self.assertEqual(config.model.context_radius_frames, 62)
+        self.assertEqual(
+            config.seconds_to_frames(config.data.sequence_seconds, 10.0)
+            - 2 * config.model.context_radius_frames,
+            76,
+        )
+        config.validate(10.0)
 
     def test_padding_values_cannot_change_valid_logits(self):
         torch.manual_seed(2)
@@ -208,6 +304,101 @@ class ModelTests(unittest.TestCase):
         torch.testing.assert_close(first, second)
 
 
+class FullSegmentValidationTests(unittest.TestCase):
+    def test_chunked_and_whole_segment_logits_match(self):
+        torch.manual_seed(4)
+        data = synthetic_data(40)
+        segment = Segment(3, 37, "validation", 1)
+        model = build_model(
+            ModelConfig(
+                model_type="deepsets_tcn",
+                dilations=(1, 2),
+                convolutions_per_block=1,
+                dropout=0.0,
+            )
+        ).eval()
+        arguments = (
+            model,
+            data.players,
+            data.player_location_valid,
+            data.player_speed_valid,
+            data.team_features,
+            data.team_feature_valid,
+            segment,
+            torch.device("cpu"),
+        )
+        whole = predict_segment_logits(*arguments)
+        chunked = predict_segment_logits(*arguments, chunk_frames=9)
+        torch.testing.assert_close(whole, chunked, rtol=1e-5, atol=1e-6)
+
+    def test_binary_validation_loss_counts_each_valid_frame_once(self):
+        torch.manual_seed(5)
+        data = synthetic_data(30)
+        valid = data.label_valid.copy()
+        valid[[8, 19]] = False
+        labels = data.labels.copy()
+        labels[~valid] = -1
+        data = WCSFData(**{**data.__dict__, "labels": labels, "label_valid": valid})
+        segments = (
+            Segment(2, 14, "validation", 1),
+            Segment(17, 28, "validation", 2),
+        )
+        model = build_model(
+            ModelConfig(dilations=(1,), convolutions_per_block=1, dropout=0.0)
+        ).eval()
+        stats = validate_full_segments(
+            model, data, segments, torch.device("cpu"), "binary"
+        )
+        losses = []
+        for segment in segments:
+            logits = predict_segment_logits(
+                model,
+                data.players,
+                data.player_location_valid,
+                data.player_speed_valid,
+                data.team_features,
+                data.team_feature_valid,
+                segment,
+                torch.device("cpu"),
+            )
+            selected = data.label_valid[segment.start : segment.end]
+            target = torch.from_numpy(data.labels[segment.start : segment.end][selected]).float()
+            losses.append(
+                torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits[selected], target, reduction="sum"
+                )
+            )
+        expected_count = sum(
+            int(data.label_valid[segment.start : segment.end].sum())
+            for segment in segments
+        )
+        self.assertEqual(stats.effective_frames, expected_count)
+        self.assertAlmostEqual(stats.loss, float(sum(losses) / expected_count), places=6)
+
+    def test_had_validation_loss_excludes_unknown_labels(self):
+        torch.manual_seed(6)
+        data = synthetic_data(20)
+        labels = (np.arange(20) % 3).astype(np.int8)
+        valid = np.ones(20, dtype=bool)
+        valid[7] = False
+        labels[7] = -1
+        data = WCSFData(**{**data.__dict__, "labels": labels, "label_valid": valid})
+        segment = Segment(2, 18, "validation", 1)
+        model = build_model(
+            ModelConfig(
+                classification_mode="had",
+                dilations=(1,),
+                convolutions_per_block=1,
+                dropout=0.0,
+            )
+        ).eval()
+        stats = validate_full_segments(
+            model, data, (segment,), torch.device("cpu"), "had", chunk_frames=6
+        )
+        self.assertEqual(stats.effective_frames, 15)
+        self.assertTrue(np.isfinite(stats.loss))
+
+
 class RealArchiveLoadingTests(unittest.TestCase):
     def test_existing_archives_load_without_label_provenance(self):
         root = Path(__file__).resolve().parents[1]
@@ -220,6 +411,21 @@ class RealArchiveLoadingTests(unittest.TestCase):
         self.assertEqual(data.labels.shape, (57374,))
         self.assertFalse(hasattr(data, "alive_vote_fraction"))
         self.assertFalse(hasattr(data, "dead_vote_count"))
+        self.assertTrue(data.label_valid.all())
+
+    def test_strict_and_had_archives_load_with_validity_masks(self):
+        root = Path(__file__).resolve().parents[1]
+        feature_path = root / "data/open_data_groningen/processed/wcsf_player_team_features.npz"
+        strict_path = root / "data/open_data_groningen/processed/wcsf_alive_dead_labels_strict.npz"
+        had_path = root / "data/open_data_groningen/processed/wcsf_had_labels.npz"
+        if not all(path.exists() for path in (feature_path, strict_path, had_path)):
+            self.skipTest("Strict processed WCSF archives are unavailable")
+        strict = load_wcsf_data(feature_path, strict_path, "binary")
+        had = load_wcsf_data(feature_path, had_path, "had")
+        self.assertEqual(np.count_nonzero(~strict.label_valid), 39)
+        self.assertEqual(np.count_nonzero(~had.label_valid), 110)
+        self.assertTrue(np.all(strict.labels[~strict.label_valid] == -1))
+        self.assertTrue(np.all(had.labels[~had.label_valid] == -1))
 
     def test_refit_normalizer_uses_complete_training_half_only(self):
         root = Path(__file__).resolve().parents[1]
@@ -232,7 +438,7 @@ class RealArchiveLoadingTests(unittest.TestCase):
         config.data.label_path = str(label_path)
         refit_loaders = build_dataloaders(config, full_half_refit=True)
         self.assertEqual(np.count_nonzero(refit_loaders.split.train_mask), 28014)
-        self.assertEqual(len(refit_loaders.validation.dataset), 0)
+        self.assertFalse(hasattr(refit_loaders, "validation"))
         self.assertFalse(
             refit_loaders.split.test_mask[refit_loaders.split.train_mask].any()
         )
@@ -319,7 +525,7 @@ class CrossValidationWorkflowTests(unittest.TestCase):
             self.assertEqual(summary["refit_epochs"], 7)
             self.assertEqual(refit.call_args.args[1], 7)
             self.assertTrue(
-                (Path(temporary) / "fold1_team_tcn_seed42/cv_summary.json").exists()
+                (Path(temporary) / "fold1_team_tcn_strict_seed42/cv_summary.json").exists()
             )
 
 

@@ -50,7 +50,7 @@ class WcsfLabelTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_unanimous_and_strict_majorities(self):
+    def test_unanimous_and_conflicting_votes(self):
         timestamp_votes = [
             (0, [0, 0, 0, 0]),
             (100, [1, 1, 1, 1]),
@@ -61,20 +61,23 @@ class WcsfLabelTests(unittest.TestCase):
         write_feature_timeline(self.feature_path, [0, 100, 200, 300])
         result = build_alive_dead_labels([self.csv_path], self.feature_path)
 
-        np.testing.assert_array_equal(result["labels"], [0, 1, 1, 0])
+        np.testing.assert_array_equal(result["labels"], [0, 1, -1, -1])
+        np.testing.assert_array_equal(result["label_valid"], [True, True, False, False])
+        np.testing.assert_array_equal(result["alive_conflict"], [False, False, True, True])
         np.testing.assert_array_equal(result["alive_vote_count"], [0, 4, 4, 1])
         np.testing.assert_array_equal(result["dead_vote_count"], [4, 0, 1, 4])
         np.testing.assert_allclose(result["alive_vote_fraction"], [0, 1, 0.8, 0.2])
         self.assertEqual(result["labels"].dtype, np.int8)
-        self.assertNotIn("label_valid", result)
+        self.assertEqual(str(result["aggregation_policy"]), "strict_unanimity")
 
-    def test_exactly_75_percent_and_weaker_majorities_are_rejected(self):
+    def test_all_non_unanimous_votes_are_invalid(self):
         for votes in ([1, 1, 1, 0], [1, 1, 1, 0, 0], [1, 1, 0, 0]):
             with self.subTest(votes=votes):
                 write_votes(self.csv_path, [(0, votes)])
                 write_feature_timeline(self.feature_path, [0])
-                with self.assertRaisesRegex(ValueError, "No strict >75%"):
-                    build_alive_dead_labels([self.csv_path], self.feature_path)
+                result = build_alive_dead_labels([self.csv_path], self.feature_path)
+                self.assertEqual(result["labels"][0], -1)
+                self.assertFalse(result["label_valid"][0])
 
     def test_missing_and_non_binary_flags_are_rejected(self):
         for value in ("", "2", "nan", "ALIVE"):
@@ -101,12 +104,12 @@ class WcsfLabelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not align exactly"):
             build_alive_dead_labels([self.csv_path], self.feature_path)
 
-    def test_validation_rejects_non_binary_label(self):
+    def test_validation_rejects_invalid_value(self):
         write_votes(self.csv_path, [(0, [1])])
         write_feature_timeline(self.feature_path, [0])
         result = build_alive_dead_labels([self.csv_path], self.feature_path)
-        result["labels"][0] = -1
-        with self.assertRaisesRegex(ValueError, "values only 0"):
+        result["labels"][0] = 3
+        with self.assertRaisesRegex(ValueError, "values -1"):
             validate_labels(result, self.feature_path)
 
     def test_archive_round_trip(self):
@@ -117,7 +120,7 @@ class WcsfLabelTests(unittest.TestCase):
         save_labels(result, output, self.feature_path)
         with np.load(output, allow_pickle=False) as archive:
             np.testing.assert_array_equal(archive["labels"], [1, 0])
-            self.assertNotIn("label_valid", archive.files)
+            np.testing.assert_array_equal(archive["label_valid"], [True, True])
 
 
 class FullWcsfLabelAcceptanceTests(unittest.TestCase):
@@ -131,7 +134,7 @@ class FullWcsfLabelAcceptanceTests(unittest.TestCase):
 
         result = build_alive_dead_labels(paths, feature_path)
         labels, counts = np.unique(result["labels"], return_counts=True)
-        self.assertEqual(dict(zip(labels.tolist(), counts.tolist())), {0: 26792, 1: 30582})
+        self.assertEqual(dict(zip(labels.tolist(), counts.tolist())), {-1: 39, 0: 26776, 1: 30559})
         self.assertEqual(len(result["labels"]), 57374)
         self.assertEqual(
             np.count_nonzero(
@@ -139,13 +142,8 @@ class FullWcsfLabelAcceptanceTests(unittest.TestCase):
             ),
             39,
         )
-        winning_fraction = np.where(
-            result["labels"] == 1,
-            result["alive_vote_fraction"],
-            result["dead_vote_fraction"],
-        )
-        self.assertTrue(np.all(winning_fraction > 0.75))
-        self.assertNotIn("label_valid", result)
+        self.assertEqual(np.count_nonzero(~result["label_valid"]), 39)
+        self.assertTrue(np.all(result["labels"][~result["label_valid"]] == -1))
 
 
 if __name__ == "__main__":

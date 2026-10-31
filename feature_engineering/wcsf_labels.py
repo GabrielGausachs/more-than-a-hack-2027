@@ -1,4 +1,4 @@
-"""Build binary WCSF ALIVE/DEAD labels aligned with the tracking features."""
+"""Build strict binary WCSF ALIVE/DEAD labels aligned with tracking features."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from typing import Dict, Iterable, Mapping, Sequence, Tuple
 import numpy as np
 
 
-MAJORITY_THRESHOLD = 0.75
 LABEL_NAMES = np.array(["DEAD", "ALIVE"])
+AGGREGATION_POLICY = np.array("strict_unanimity")
 
 _VOTE_DTYPE = np.dtype(
     [
@@ -94,12 +94,8 @@ def _feature_timeline(feature_archive_path: Path | str) -> Tuple[np.ndarray, np.
 def build_alive_dead_labels(
     paths: Sequence[Path | str],
     feature_archive_path: Path | str,
-    majority_threshold: float = MAJORITY_THRESHOLD,
 ) -> Dict[str, np.ndarray]:
-    """Aggregate player votes into binary timestamp labels and align them to features."""
-    if not 0.5 < majority_threshold < 1.0:
-        raise ValueError("majority_threshold must be strictly between 0.5 and 1.0")
-
+    """Aggregate unanimous votes; conflicting timestamps receive label ``-1``."""
     votes = load_alive_votes(paths)
     if not len(votes):
         raise ValueError("No AliveFlag votes were loaded")
@@ -144,24 +140,14 @@ def build_alive_dead_labels(
 
     alive_fraction = alive_count_i64 / vote_count
     dead_fraction = dead_count_i64 / vote_count
-    majority_share = np.maximum(alive_fraction, dead_fraction)
-    insufficient = majority_share <= majority_threshold
-    if insufficient.any():
-        frame_rows = np.flatnonzero(frame_start)
-        index = np.flatnonzero(insufficient)[0]
-        vote = votes[frame_rows[index]]
-        raise ValueError(
-            f"No strict >{majority_threshold:.0%} AliveFlag majority for "
-            f"half={vote['half_id']}, timestamp_ms={vote['timestamp_ms']}: "
-            f"ALIVE={alive_count_i64[index]}/{vote_count[index]}, "
-            f"DEAD={dead_count_i64[index]}/{vote_count[index]}"
-        )
-
     frame_rows = np.flatnonzero(frame_start)
     half_id = votes["half_id"][frame_rows].astype(np.int8)
     timestamp_ms = votes["timestamp_ms"][frame_rows].astype(np.int64)
     sample_index = np.arange(n_frames, dtype=np.int64)
-    labels = (alive_count_i64 > dead_count_i64).astype(np.int8)
+    alive_conflict = (alive_count_i64 > 0) & (dead_count_i64 > 0)
+    label_valid = ~alive_conflict
+    labels = np.full(n_frames, -1, dtype=np.int8)
+    labels[label_valid] = (alive_count_i64[label_valid] > 0).astype(np.int8)
 
     feature_half, feature_time, feature_index = _feature_timeline(feature_archive_path)
     if not (
@@ -173,6 +159,8 @@ def build_alive_dead_labels(
 
     result = {
         "labels": labels,
+        "label_valid": label_valid,
+        "alive_conflict": alive_conflict,
         "alive_vote_count": alive_count_i64.astype(np.uint8),
         "dead_vote_count": dead_count_i64.astype(np.uint8),
         "alive_vote_fraction": alive_fraction.astype(np.float32),
@@ -181,8 +169,8 @@ def build_alive_dead_labels(
         "half_id": half_id,
         "sample_index": sample_index,
         "label_names": LABEL_NAMES,
-        "majority_threshold": np.array(majority_threshold, dtype=np.float32),
-        "schema_version": np.array("1.0"),
+        "aggregation_policy": AGGREGATION_POLICY,
+        "schema_version": np.array("2.0"),
     }
     validate_labels(result, feature_archive_path)
     return result
@@ -191,9 +179,11 @@ def build_alive_dead_labels(
 def validate_labels(
     result: Mapping[str, np.ndarray], feature_archive_path: Path | str
 ) -> None:
-    """Validate binary labels, vote provenance, chronology and feature alignment."""
+    """Validate strict binary labels, provenance, chronology and alignment."""
     required = {
         "labels",
+        "label_valid",
+        "alive_conflict",
         "alive_vote_count",
         "dead_vote_count",
         "alive_vote_fraction",
@@ -201,7 +191,7 @@ def validate_labels(
         "timestamp_ms",
         "half_id",
         "sample_index",
-        "majority_threshold",
+        "aggregation_policy",
     }
     missing = required.difference(result)
     if missing:
@@ -210,6 +200,8 @@ def validate_labels(
     labels = result["labels"]
     n_frames = len(labels)
     for name in (
+        "label_valid",
+        "alive_conflict",
         "alive_vote_count",
         "dead_vote_count",
         "alive_vote_fraction",
@@ -220,8 +212,10 @@ def validate_labels(
     ):
         if result[name].shape != (n_frames,):
             raise ValueError(f"{name} must have shape ({n_frames},)")
-    if labels.dtype != np.int8 or not np.isin(labels, (0, 1)).all():
-        raise ValueError("labels must be int8 with values only 0 (DEAD) and 1 (ALIVE)")
+    if labels.dtype != np.int8 or not np.isin(labels, (-1, 0, 1)).all():
+        raise ValueError("labels must be int8 with values -1 (UNKNOWN), 0 (DEAD), or 1 (ALIVE)")
+    if result["label_valid"].dtype != np.bool_ or result["alive_conflict"].dtype != np.bool_:
+        raise ValueError("label_valid and alive_conflict must be Boolean")
     if result["alive_vote_count"].dtype != np.uint8 or result["dead_vote_count"].dtype != np.uint8:
         raise ValueError("Vote counts must use uint8")
     if result["alive_vote_fraction"].dtype != np.float32 or result["dead_vote_fraction"].dtype != np.float32:
@@ -239,13 +233,18 @@ def validate_labels(
     if not np.allclose(result["dead_vote_fraction"], expected_dead_fraction, atol=1e-7):
         raise ValueError("dead_vote_fraction is inconsistent with vote counts")
 
-    threshold = float(result["majority_threshold"])
-    majority_share = np.maximum(expected_alive_fraction, expected_dead_fraction)
-    if np.any(majority_share <= threshold):
-        raise ValueError("Every timestamp must have a majority strictly above the threshold")
-    expected_labels = (alive_count > dead_count).astype(np.int8)
+    expected_conflict = (alive_count > 0) & (dead_count > 0)
+    expected_valid = ~expected_conflict
+    if not np.array_equal(result["alive_conflict"], expected_conflict):
+        raise ValueError("alive_conflict is inconsistent with vote counts")
+    if not np.array_equal(result["label_valid"], expected_valid):
+        raise ValueError("label_valid is inconsistent with AliveFlag unanimity")
+    expected_labels = np.full(n_frames, -1, dtype=np.int8)
+    expected_labels[expected_valid] = (alive_count[expected_valid] > 0).astype(np.int8)
     if not np.array_equal(labels, expected_labels):
-        raise ValueError("labels are inconsistent with the AliveFlag vote majority")
+        raise ValueError("labels are inconsistent with strict AliveFlag unanimity")
+    if str(result["aggregation_policy"]) != str(AGGREGATION_POLICY):
+        raise ValueError("aggregation_policy must be strict_unanimity")
 
     if not np.array_equal(result["sample_index"], np.arange(n_frames)):
         raise ValueError("sample_index must be contiguous and zero-based")
@@ -285,7 +284,7 @@ def _default_paths() -> Tuple[Path, Path, Path, Path]:
         data_dir / "positions_FIRST_HALF.csv",
         data_dir / "positions_SECOND_HALF.csv",
         processed_dir / "wcsf_player_team_features.npz",
-        processed_dir / "wcsf_alive_dead_labels.npz",
+        processed_dir / "wcsf_alive_dead_labels_strict.npz",
     )
 
 
@@ -298,17 +297,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=output_default)
     args = parser.parse_args()
 
-    result = build_alive_dead_labels(
-        (args.first_half, args.second_half), args.features, MAJORITY_THRESHOLD
-    )
+    result = build_alive_dead_labels((args.first_half, args.second_half), args.features)
     save_labels(result, args.output, args.features)
-    labels, counts = np.unique(result["labels"], return_counts=True)
+    labels, counts = np.unique(result["labels"][result["label_valid"]], return_counts=True)
     label_counts = {str(LABEL_NAMES[label]): int(count) for label, count in zip(labels, counts)}
-    conflicts = np.count_nonzero(
-        (result["alive_vote_count"] > 0) & (result["dead_vote_count"] > 0)
-    )
+    conflicts = int(np.count_nonzero(result["alive_conflict"]))
     print(f"Saved {len(result['labels']):,} labels to {args.output}")
-    print(f"Label counts: {label_counts}; majority-resolved conflicts: {conflicts}")
+    print(f"Valid label counts: {label_counts}; invalid conflicts: {conflicts}")
 
 
 if __name__ == "__main__":

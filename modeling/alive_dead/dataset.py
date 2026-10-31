@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Sequence
 
 import numpy as np
 import torch
@@ -27,13 +27,24 @@ class WCSFData:
     half_id: np.ndarray
     sample_index: np.ndarray
     source_fps: float
+    label_valid: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.label_valid is None:
+            object.__setattr__(self, "label_valid", np.ones(len(self.labels), dtype=bool))
+        elif self.label_valid.shape != (len(self.labels),) or self.label_valid.dtype != np.bool_:
+            raise ValueError("label_valid must be Boolean with one value per frame")
 
     @property
     def n_frames(self) -> int:
         return len(self.labels)
 
 
-def load_wcsf_data(feature_path: str | Path, label_path: str | Path) -> WCSFData:
+def load_wcsf_data(
+    feature_path: str | Path,
+    label_path: str | Path,
+    classification_mode: str = "binary",
+) -> WCSFData:
     """Load approved model arrays and verify exact feature/label alignment."""
     feature_keys = {
         "players",
@@ -58,6 +69,17 @@ def load_wcsf_data(feature_path: str | Path, label_path: str | Path) -> WCSFData
         if missing:
             raise ValueError(f"Label archive is missing arrays: {sorted(missing)}")
         labels = archive["labels"].copy()
+        if "label_valid" in archive.files:
+            label_valid = archive["label_valid"].copy()
+        elif classification_mode == "binary":
+            label_valid = np.ones(len(labels), dtype=bool)
+        else:
+            raise ValueError("H/A/D label archives must contain label_valid")
+        if classification_mode == "had":
+            if "label_names" not in archive.files or not np.array_equal(
+                archive["label_names"], np.array(["H", "A", "D"])
+            ):
+                raise ValueError("H/A/D archives must declare label_names [H, A, D]")
         label_timeline = {key: archive[key].copy() for key in required if key != "labels"}
 
     for key in ("timestamp_ms", "half_id", "sample_index"):
@@ -74,8 +96,17 @@ def load_wcsf_data(feature_path: str | Path, label_path: str | Path) -> WCSFData
         raise ValueError("team_features must have shape (N, 2, 6)")
     if features["team_feature_valid"].shape != (n_frames, 2, 6):
         raise ValueError("team_feature_valid has an unexpected shape")
-    if labels.dtype != np.int8 or not np.isin(labels, (0, 1)).all():
-        raise ValueError("labels must be binary int8 values")
+    if classification_mode not in ("binary", "had"):
+        raise ValueError("classification_mode must be 'binary' or 'had'")
+    allowed = (0, 1) if classification_mode == "binary" else (0, 1, 2)
+    if labels.dtype != np.int8:
+        raise ValueError("labels must use int8")
+    if label_valid.dtype != np.bool_ or label_valid.shape != (n_frames,):
+        raise ValueError("label_valid must be Boolean with one value per frame")
+    if not np.isin(labels[label_valid], allowed).all():
+        raise ValueError(f"Valid {classification_mode} labels have unexpected values")
+    if np.any(labels[~label_valid] != -1):
+        raise ValueError("Invalid labels must use the -1 sentinel")
     if features["players"].dtype != np.float32 or features["team_features"].dtype != np.float32:
         raise ValueError("Model feature arrays must use float32")
     for key in ("player_location_valid", "player_speed_valid", "team_feature_valid"):
@@ -104,6 +135,7 @@ def load_wcsf_data(feature_path: str | Path, label_path: str | Path) -> WCSFData
         half_id=features["half_id"],
         sample_index=features["sample_index"],
         source_fps=source_fps,
+        label_valid=label_valid,
     )
 
 
@@ -111,7 +143,8 @@ def load_wcsf_data(feature_path: str | Path, label_path: str | Path) -> WCSFData
 class Window:
     start: int
     valid_length: int
-    segment: Segment
+    supervision_start: int
+    supervision_end: int
 
 
 class TemporalWindowDataset(Dataset):
@@ -123,26 +156,52 @@ class TemporalWindowDataset(Dataset):
         segments: Sequence[Segment],
         sequence_frames: int,
         stride_frames: int,
+        context_radius: int,
     ) -> None:
         if sequence_frames < 1 or stride_frames < 1 or stride_frames > sequence_frames:
             raise ValueError("Require 1 <= stride_frames <= sequence_frames")
         self.data = data
-        self.segments = tuple(segments)
         self.sequence_frames = sequence_frames
-        self.stride_frames = stride_frames
+        central_width = sequence_frames - 2 * context_radius
+        if context_radius < 0 or central_width < 1:
+            raise ValueError("Context radius leaves no supervised center")
+        if stride_frames > central_width:
+            raise ValueError("stride_frames cannot exceed the supervised central width")
         self.windows = []
         coverage = np.zeros(data.n_frames, dtype=np.int32)
-        for segment in self.segments:
+        segments = tuple(segments)
+        for segment in segments:
             if segment.start < 0 or segment.end > data.n_frames or segment.start >= segment.end:
                 raise ValueError(f"Invalid temporal segment: {segment}")
-            for offset in range(0, segment.length, stride_frames):
-                start = segment.start + offset
+            if segment.length <= sequence_frames:
+                starts = [segment.start]
+            else:
+                last_start = segment.end - sequence_frames
+                starts = list(range(segment.start, last_start + 1, stride_frames))
+                if starts[-1] != last_start:
+                    starts.append(last_start)
+            for start in starts:
                 valid_length = min(sequence_frames, segment.end - start)
-                window = Window(start, valid_length, segment)
+                supervision_start = 0 if start == segment.start else context_radius
+                supervision_end = (
+                    valid_length
+                    if start + valid_length == segment.end
+                    else valid_length - context_radius
+                )
+                if supervision_start >= supervision_end:
+                    raise ValueError("Window has no eligible supervised outputs")
+                window = Window(
+                    start,
+                    valid_length,
+                    supervision_start,
+                    supervision_end,
+                )
                 self.windows.append(window)
-                coverage[start : start + valid_length] += 1
+                coverage[
+                    start + supervision_start : start + supervision_end
+                ] += 1
         expected = np.zeros(data.n_frames, dtype=bool)
-        for segment in self.segments:
+        for segment in segments:
             expected[segment.start : segment.end] = True
         if np.any(coverage[expected] == 0) or np.any(coverage[~expected] != 0):
             raise ValueError("Window construction does not exactly cover the supplied segments")
@@ -164,12 +223,15 @@ class TemporalWindowDataset(Dataset):
         window = self.windows[index]
         output_mask = np.zeros(self.sequence_frames, dtype=bool)
         output_mask[: window.valid_length] = True
+        supervision_mask = np.zeros(self.sequence_frames, dtype=bool)
+        supervision_mask[window.supervision_start : window.supervision_end] = True
         loss_weight = np.zeros(self.sequence_frames, dtype=np.float32)
-        frame_slice = slice(window.start, window.start + window.valid_length)
-        loss_weight[: window.valid_length] = 1.0 / self.coverage[frame_slice]
-        global_index = np.full(self.sequence_frames, -1, dtype=np.int64)
-        global_index[: window.valid_length] = np.arange(
-            window.start, window.start + window.valid_length
+        supervised_global = slice(
+            window.start + window.supervision_start,
+            window.start + window.supervision_end,
+        )
+        loss_weight[window.supervision_start : window.supervision_end] = (
+            1.0 / self.coverage[supervised_global]
         )
         return {
             "players": torch.from_numpy(self._padded(self.data.players, window)),
@@ -184,19 +246,44 @@ class TemporalWindowDataset(Dataset):
                 self._padded(self.data.team_feature_valid, window)
             ),
             "labels": torch.from_numpy(
-                self._padded(self.data.labels, window).astype(np.float32)
+                self._padded(self.data.labels, window, fill_value=-1).astype(np.float32)
+            ),
+            "label_valid": torch.from_numpy(
+                self._padded(self.data.label_valid, window, fill_value=False)
             ),
             "output_mask": torch.from_numpy(output_mask),
+            "supervision_mask": torch.from_numpy(supervision_mask),
             "loss_weight": torch.from_numpy(loss_weight),
-            "global_index": torch.from_numpy(global_index),
         }
+
+
+def normalize_wcsf_data(data: WCSFData, normalizer: FeatureNormalizer) -> WCSFData:
+    """Apply one fitted normalizer while preserving timelines, labels and masks."""
+    players, team_features = normalizer.transform(
+        data.players,
+        data.player_location_valid,
+        data.player_speed_valid,
+        data.team_features,
+        data.team_feature_valid,
+    )
+    return WCSFData(
+        players=players,
+        player_location_valid=data.player_location_valid,
+        player_speed_valid=data.player_speed_valid,
+        team_features=team_features,
+        team_feature_valid=data.team_feature_valid,
+        labels=data.labels,
+        timestamp_ms=data.timestamp_ms,
+        half_id=data.half_id,
+        sample_index=data.sample_index,
+        source_fps=data.source_fps,
+        label_valid=data.label_valid,
+    )
 
 
 @dataclass(frozen=True)
 class LoaderBundle:
     train: DataLoader
-    validation: DataLoader
-    test: DataLoader
     split: FoldSplit
     normalizer: FeatureNormalizer
     data: WCSFData
@@ -206,7 +293,11 @@ def build_dataloaders(
     config: ExperimentConfig, full_half_refit: bool = False
 ) -> LoaderBundle:
     """Build aligned normalized loaders for an inner split or full-half refit."""
-    raw = load_wcsf_data(config.data.feature_path, config.data.label_path)
+    raw = load_wcsf_data(
+        config.data.feature_path,
+        config.data.label_path,
+        config.model.classification_mode,
+    )
     config.validate(raw.source_fps)
     if full_half_refit:
         split = build_refit_split(raw.half_id, config.split.fold)
@@ -226,35 +317,16 @@ def build_dataloaders(
         raw.team_feature_valid,
         split.train_mask,
     )
-    normalized_players, normalized_team = normalizer.transform(
-        raw.players,
-        raw.player_location_valid,
-        raw.player_speed_valid,
-        raw.team_features,
-        raw.team_feature_valid,
-    )
-    data = WCSFData(
-        players=normalized_players,
-        player_location_valid=raw.player_location_valid,
-        player_speed_valid=raw.player_speed_valid,
-        team_features=normalized_team,
-        team_feature_valid=raw.team_feature_valid,
-        labels=raw.labels,
-        timestamp_ms=raw.timestamp_ms,
-        half_id=raw.half_id,
-        sample_index=raw.sample_index,
-        source_fps=raw.source_fps,
-    )
+    data = normalize_wcsf_data(raw, normalizer)
     sequence_frames = config.seconds_to_frames(config.data.sequence_seconds, raw.source_fps)
     train_stride = config.seconds_to_frames(config.data.train_stride_seconds, raw.source_fps)
-    eval_stride = config.seconds_to_frames(config.data.eval_stride_seconds, raw.source_fps)
-    datasets = {
-        "train": TemporalWindowDataset(data, split.segments["train"], sequence_frames, train_stride),
-        "validation": TemporalWindowDataset(
-            data, split.segments["validation"], sequence_frames, eval_stride
-        ),
-        "test": TemporalWindowDataset(data, split.segments["test"], sequence_frames, eval_stride),
-    }
+    train_dataset = TemporalWindowDataset(
+        data,
+        split.segments["train"],
+        sequence_frames,
+        train_stride,
+        config.model.context_radius_frames,
+    )
     generator = torch.Generator().manual_seed(config.training.seed)
     common = {
         "batch_size": config.training.batch_size,
@@ -263,9 +335,7 @@ def build_dataloaders(
         "persistent_workers": config.data.num_workers > 0,
     }
     return LoaderBundle(
-        train=DataLoader(datasets["train"], shuffle=True, generator=generator, **common),
-        validation=DataLoader(datasets["validation"], shuffle=False, **common),
-        test=DataLoader(datasets["test"], shuffle=False, **common),
+        train=DataLoader(train_dataset, shuffle=True, generator=generator, **common),
         split=split,
         normalizer=normalizer,
         data=data,

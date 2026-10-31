@@ -39,8 +39,8 @@ team_features            (B,T,2,6)
 team_feature_valid       (B,T,2,6)
 labels                   (B,T)
 output_mask              (B,T)
+supervision_mask         (B,T)
 loss_weight              (B,T)
-global_index             (B,T)
 ```
 
 ## Folds
@@ -59,9 +59,18 @@ Every inner validation interval has a 100-frame (10-second) buffer on both sides
 parts of the training half are independent training segments. Windows can never cross a half,
 partition, buffer or disconnected training interval.
 
-The default 100-frame training windows use stride 50. Inverse-coverage loss weights ensure each
-original frame has total weight one per epoch despite overlap. Validation and future test windows
-use stride 100, with right padding and an output mask on the final window.
+The default 100-frame training windows use stride 40. Only outputs with their complete available
+TCN context contribute to loss: artificial window edges are context-only, while genuine temporal
+segment edges remain supervised with the same natural zero padding used by full-segment inference.
+The receptive-field radius and supervised center are derived from the model configuration.
+Inverse supervised-coverage weights ensure each original frame has total weight one despite
+overlap, and configuration validation rejects strides that would leave supervision gaps.
+
+Validation does not use temporal windows. Each contiguous validation segment is inferred once as
+a complete sequence, UNKNOWN labels are excluded, and BCE/CE is averaged over all valid frames.
+This full-segment loss drives scheduling, checkpoint selection and early stopping. Evaluation uses
+the same shared segment-inference function; optional halo chunking is available for constrained
+memory without changing logits.
 
 ## Normalization
 
@@ -117,10 +126,11 @@ python -m modeling.alive_dead.train --config path/to/config.json
 ```
 
 One command runs all three inner blocks and then the full-half refit. Inner runs use AdamW,
-unweighted masked BCE, ReduceLROnPlateau, gradient clipping and validation-loss early stopping.
+masked BCE or cross-entropy, ReduceLROnPlateau, gradient clipping and full-segment validation-loss
+early stopping.
 Their median best epoch becomes the fixed refit length. The refit starts from new weights, uses
 the complete training half, constant configured learning rate and no validation-dependent
-scheduler. It never iterates the outer test loader.
+scheduler. Training constructs no test DataLoader and never performs outer-test inference.
 
 Artifacts are kept separate from legacy single-block runs:
 
@@ -216,4 +226,54 @@ are zero-filled and must be interpreted through `prediction_valid_25hz`.
 
 - Threshold selection or probability calibration.
 - Tracking degradation augmentation or domain adaptation.
-- H/A possession classification and final spell decoding.
+- Final spell decoding or temporal smoothing.
+
+## Strict labels and direct H/A/D mode
+
+New binary experiments use strict unanimity labels. The 39 timestamps with conflicting
+`AliveFlag` votes remain in every input sequence but have `label_valid=False`, label `-1`, and
+zero supervised loss. They also split evaluation runs, so a scored segment never crosses an
+ambiguous timestamp. The original majority-voted archive and historical run directories are
+unchanged. Rebuild the two strict archives with:
+
+```powershell
+python -m feature_engineering.wcsf_labels
+python -m feature_engineering.wcsf_had_labels
+```
+
+The direct three-class task uses `H=0`, `A=1`, `D=2`, masked cross-entropy, and the same features,
+normalization, purged folds, temporal windows and TCN. DEAD takes precedence whenever the alive
+vote is unanimously dead. An alive timestamp is supervised only when both the alive and
+possession votes are unanimous. This leaves 110 H/A/D timestamps invalid.
+
+Use a JSON config containing the following fields, or use the command-line mode (which selects
+the H/A/D archive when no JSON config is supplied):
+
+```json
+{
+  "data": {
+    "label_path": "data/open_data_groningen/processed/wcsf_had_labels.npz"
+  },
+  "model": {
+    "classification_mode": "had",
+    "model_type": "deepsets_tcn"
+  }
+}
+```
+
+```powershell
+python -m modeling.alive_dead.train --fold 1 --model-type deepsets_tcn --classification-mode had
+python -m modeling.alive_dead.evaluate_had --fold 1 --model-type deepsets_tcn --partition test
+python -m modeling.alive_dead.evaluate_had --fold all --model-type deepsets_tcn
+```
+
+H/A/D runs are stored separately as `fold<fold>_<model>_had_seed<seed>`. Strict binary runs use
+`fold<fold>_<model>_strict_seed<seed>`, preventing either task from overwriting legacy binary
+checkpoints. Binary WCSF evaluation selects strict runs by default; pass `--label-policy legacy`
+to reproduce a historical majority-voted run. Metrica binary transfer continues to use the
+legacy ALIVE/DEAD checkpoints.
+
+H/A/D evaluation reports frame accuracy, macro F1, per-class precision/recall/F1, a 3x3
+confusion matrix, and the official one-to-one possession-spell F1 at IoUs 0.3 through 0.7.
+Fragmentation and transition diagnostics use explicit valid runs and 10 Hz tolerances of 5 and
+10 frames. Neither spells nor transitions cross halftime or an invalid-label gap.

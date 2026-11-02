@@ -31,6 +31,10 @@ class WCSFData:
     ball_location_valid: np.ndarray | None = None
     ball_speed_valid: np.ndarray | None = None
     label_valid: np.ndarray | None = None
+    alive_labels: np.ndarray | None = None
+    alive_label_valid: np.ndarray | None = None
+    possession_labels: np.ndarray | None = None
+    possession_label_valid: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.label_valid is None:
@@ -50,6 +54,39 @@ class WCSFData:
                 or self.ball_speed_valid.shape != (len(self.labels),)
             ):
                 raise ValueError("Ball validity masks must have shape (N,)")
+        hierarchical = (
+            self.alive_labels,
+            self.alive_label_valid,
+            self.possession_labels,
+            self.possession_label_valid,
+        )
+        if any(value is not None for value in hierarchical) and not all(
+            value is not None for value in hierarchical
+        ):
+            raise ValueError("Hierarchical targets and validity masks must be provided together")
+        if self.alive_labels is not None:
+            for name, values in (
+                ("alive_labels", self.alive_labels),
+                ("possession_labels", self.possession_labels),
+            ):
+                if values.shape != (len(self.labels),) or values.dtype != np.int8:
+                    raise ValueError(f"{name} must be int8 with shape (N,)")
+            for name, values in (
+                ("alive_label_valid", self.alive_label_valid),
+                ("possession_label_valid", self.possession_label_valid),
+            ):
+                if values.shape != (len(self.labels),) or values.dtype != np.bool_:
+                    raise ValueError(f"{name} must be Boolean with shape (N,)")
+            if not np.isin(self.alive_labels[self.alive_label_valid], (0, 1)).all():
+                raise ValueError("Valid ALIVE targets must be binary")
+            if not np.isin(
+                self.possession_labels[self.possession_label_valid], (0, 1)
+            ).all():
+                raise ValueError("Valid possession targets must be H=0 or A=1")
+            if np.any(self.alive_labels[~self.alive_label_valid] != -1) or np.any(
+                self.possession_labels[~self.possession_label_valid] != -1
+            ):
+                raise ValueError("Invalid hierarchical targets must use the -1 sentinel")
 
     @property
     def n_frames(self) -> int:
@@ -61,6 +98,7 @@ def load_wcsf_data(
     label_path: str | Path,
     classification_mode: str = "binary",
     use_ball: bool = False,
+    had_head_type: str = "direct",
 ) -> WCSFData:
     """Load approved model arrays and verify exact feature/label alignment."""
     feature_keys = {
@@ -88,6 +126,7 @@ def load_wcsf_data(
         if use_ball:
             features.update({key: archive[key].copy() for key in ball_keys})
 
+    hierarchical_targets = None
     with np.load(label_path, allow_pickle=False) as archive:
         required = {"labels", "timestamp_ms", "half_id", "sample_index"}
         missing = required.difference(archive.files)
@@ -105,6 +144,60 @@ def load_wcsf_data(
                 archive["label_names"], np.array(["H", "A", "D"])
             ):
                 raise ValueError("H/A/D archives must declare label_names [H, A, D]")
+        if had_head_type == "hierarchical":
+            if classification_mode != "had":
+                raise ValueError("Hierarchical targets require classification_mode='had'")
+            provenance = {
+                "alive_vote_count",
+                "dead_vote_count",
+                "home_possession_vote_count",
+                "away_possession_vote_count",
+            }
+            missing = provenance.difference(archive.files)
+            if missing:
+                raise ValueError(
+                    f"Hierarchical H/A/D labels are missing provenance: {sorted(missing)}"
+                )
+            alive_votes = archive["alive_vote_count"].astype(np.int64)
+            dead_votes = archive["dead_vote_count"].astype(np.int64)
+            home_votes = archive["home_possession_vote_count"].astype(np.int64)
+            away_votes = archive["away_possession_vote_count"].astype(np.int64)
+            if any(
+                values.shape != labels.shape
+                for values in (alive_votes, dead_votes, home_votes, away_votes)
+            ):
+                raise ValueError("Hierarchical vote provenance has unexpected shapes")
+            if np.any(alive_votes + dead_votes == 0) or not np.array_equal(
+                alive_votes + dead_votes, home_votes + away_votes
+            ):
+                raise ValueError("Hierarchical vote provenance is empty or inconsistent")
+            unanimous_alive = (alive_votes > 0) & (dead_votes == 0)
+            unanimous_dead = (dead_votes > 0) & (alive_votes == 0)
+            alive_valid = unanimous_alive | unanimous_dead
+            alive_targets = np.full(len(labels), -1, dtype=np.int8)
+            alive_targets[unanimous_dead] = 0
+            alive_targets[unanimous_alive] = 1
+            valid_home = unanimous_alive & (home_votes > 0) & (away_votes == 0)
+            valid_away = unanimous_alive & (away_votes > 0) & (home_votes == 0)
+            possession_valid = valid_home | valid_away
+            possession_targets = np.full(len(labels), -1, dtype=np.int8)
+            possession_targets[valid_home] = 0
+            possession_targets[valid_away] = 1
+            hierarchical_targets = (
+                alive_targets,
+                alive_valid.astype(bool),
+                possession_targets,
+                possession_valid.astype(bool),
+            )
+            expected_had_valid = unanimous_dead | valid_home | valid_away
+            expected_had = np.full(len(labels), -1, dtype=np.int8)
+            expected_had[valid_home] = 0
+            expected_had[valid_away] = 1
+            expected_had[unanimous_dead] = 2
+            if not np.array_equal(label_valid, expected_had_valid) or not np.array_equal(
+                labels, expected_had
+            ):
+                raise ValueError("Hierarchical provenance disagrees with H/A/D labels")
         label_timeline = {key: archive[key].copy() for key in required if key != "labels"}
 
     for key in ("timestamp_ms", "half_id", "sample_index"):
@@ -123,6 +216,8 @@ def load_wcsf_data(
         raise ValueError("team_feature_valid has an unexpected shape")
     if classification_mode not in ("binary", "had"):
         raise ValueError("classification_mode must be 'binary' or 'had'")
+    if had_head_type not in ("direct", "hierarchical"):
+        raise ValueError("had_head_type must be 'direct' or 'hierarchical'")
     allowed = (0, 1) if classification_mode == "binary" else (0, 1, 2)
     if labels.dtype != np.int8:
         raise ValueError("labels must use int8")
@@ -176,6 +271,10 @@ def load_wcsf_data(
         ball_location_valid=features.get("ball_location_valid"),
         ball_speed_valid=features.get("ball_speed_valid"),
         label_valid=label_valid,
+        alive_labels=None if hierarchical_targets is None else hierarchical_targets[0],
+        alive_label_valid=None if hierarchical_targets is None else hierarchical_targets[1],
+        possession_labels=None if hierarchical_targets is None else hierarchical_targets[2],
+        possession_label_valid=None if hierarchical_targets is None else hierarchical_targets[3],
     )
 
 
@@ -307,6 +406,31 @@ class TemporalWindowDataset(Dataset):
                     ),
                 }
             )
+        if self.data.alive_labels is not None:
+            batch.update(
+                {
+                    "alive_labels": torch.from_numpy(
+                        self._padded(self.data.alive_labels, window, fill_value=-1).astype(
+                            np.float32
+                        )
+                    ),
+                    "alive_label_valid": torch.from_numpy(
+                        self._padded(
+                            self.data.alive_label_valid, window, fill_value=False
+                        )
+                    ),
+                    "possession_labels": torch.from_numpy(
+                        self._padded(
+                            self.data.possession_labels, window, fill_value=-1
+                        ).astype(np.float32)
+                    ),
+                    "possession_label_valid": torch.from_numpy(
+                        self._padded(
+                            self.data.possession_label_valid, window, fill_value=False
+                        )
+                    ),
+                }
+            )
         return batch
 
 
@@ -339,6 +463,10 @@ def normalize_wcsf_data(data: WCSFData, normalizer: FeatureNormalizer) -> WCSFDa
         ball_location_valid=data.ball_location_valid,
         ball_speed_valid=data.ball_speed_valid,
         label_valid=data.label_valid,
+        alive_labels=data.alive_labels,
+        alive_label_valid=data.alive_label_valid,
+        possession_labels=data.possession_labels,
+        possession_label_valid=data.possession_label_valid,
     )
 
 
@@ -359,6 +487,7 @@ def build_dataloaders(
         config.data.label_path,
         config.model.classification_mode,
         config.model.use_ball,
+        config.model.had_head_type,
     )
     config.validate(raw.source_fps)
     if full_half_refit:

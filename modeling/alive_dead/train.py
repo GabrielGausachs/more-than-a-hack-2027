@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .config import ExperimentConfig, load_config
+from .config import ExperimentConfig, ModelConfig, load_config
 from .dataset import LoaderBundle, WCSFData, build_dataloaders
 from .evaluate import evaluate_checkpoint, select_device
 from .inference import predict_segment_logits
@@ -29,6 +29,24 @@ from .tcn import build_model
 class EpochStats:
     loss: float
     effective_frames: float
+    alive_loss: float | None = None
+    possession_loss: float | None = None
+    alive_frames: float | None = None
+    possession_frames: float | None = None
+
+
+def _stats_fields(prefix: str, stats: EpochStats) -> Dict[str, float]:
+    values = {f"{prefix}_loss": stats.loss}
+    if stats.alive_loss is not None:
+        values.update(
+            {
+                f"{prefix}_alive_bce": stats.alive_loss,
+                f"{prefix}_possession_ce": stats.possession_loss,
+                f"{prefix}_alive_frames": stats.alive_frames,
+                f"{prefix}_possession_frames": stats.possession_frames,
+            }
+        )
+    return values
 
 
 def set_reproducible_seed(seed: int) -> None:
@@ -81,9 +99,9 @@ def masked_cross_entropy_components(
     loss_weight: torch.Tensor,
     label_valid: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return weighted H/A/D cross-entropy over supervised outputs only."""
-    if logits.ndim != 3 or logits.shape[-1] != 3:
-        raise ValueError("H/A/D logits must have shape (B, T, 3)")
+    """Return weighted categorical cross-entropy over supervised outputs only."""
+    if logits.ndim != 3 or logits.shape[-1] < 2:
+        raise ValueError("Categorical logits must have shape (B, T, C), C >= 2")
     expected = logits.shape[:2]
     if any(
         value.shape != expected
@@ -104,13 +122,62 @@ def masked_cross_entropy_components(
     return (element_loss * effective_weight).sum(), denominator
 
 
+def hierarchical_loss_components(
+    logits: torch.Tensor,
+    batch: Mapping[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return independently normalized ALIVE and conditional-possession components."""
+    if logits.ndim != 3 or logits.shape[-1] != 3:
+        raise ValueError("Hierarchical outputs must have shape (B, T, 3)")
+    required = {
+        "alive_labels",
+        "alive_label_valid",
+        "possession_labels",
+        "possession_label_valid",
+        "supervision_mask",
+        "loss_weight",
+    }
+    missing = required.difference(batch)
+    if missing:
+        raise ValueError(f"Hierarchical batch is missing values: {sorted(missing)}")
+    alive_numerator, alive_denominator = masked_bce_components(
+        logits[..., 0],
+        batch["alive_labels"],
+        batch["supervision_mask"],
+        batch["loss_weight"],
+        batch["alive_label_valid"],
+    )
+    possession_weight = (
+        batch["supervision_mask"].to(logits.dtype)
+        * batch["possession_label_valid"].to(logits.dtype)
+        * batch["loss_weight"].to(logits.dtype)
+    )
+    possession_denominator = possession_weight.sum()
+    if possession_denominator.item() > 0:
+        possession_loss = F.cross_entropy(
+            logits[..., 1:].transpose(1, 2),
+            batch["possession_labels"].long(),
+            reduction="none",
+            ignore_index=-1,
+        )
+        possession_numerator = (possession_loss * possession_weight).sum()
+    else:
+        possession_numerator = logits[..., 1:].sum() * 0.0
+    return (
+        alive_numerator,
+        alive_denominator,
+        possession_numerator,
+        possession_denominator,
+    )
+
+
 def train_epoch(
     model: nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer,
+    model_config: ModelConfig,
     gradient_clip_norm: float | None = None,
-    classification_mode: str = "binary",
     show_progress: bool = False,
     description: str = "Training",
 ) -> EpochStats:
@@ -118,6 +185,10 @@ def train_epoch(
     model.train()
     total_numerator = 0.0
     total_denominator = 0.0
+    alive_numerator_total = 0.0
+    alive_denominator_total = 0.0
+    possession_numerator_total = 0.0
+    possession_denominator_total = 0.0
     batches = progress(
         loader,
         enabled=show_progress,
@@ -130,27 +201,65 @@ def train_epoch(
         batch = move_batch(cpu_batch, device)
         optimizer.zero_grad(set_to_none=True)
         logits = model(batch)
-        loss_function = (
-            masked_bce_components
-            if classification_mode == "binary"
-            else masked_cross_entropy_components
-        )
-        numerator, denominator = loss_function(
-            logits,
-            batch["labels"],
-            batch["supervision_mask"],
-            batch["loss_weight"],
-            batch["label_valid"],
-        )
-        loss = numerator / denominator
+        if (
+            model_config.classification_mode == "had"
+            and model_config.had_head_type == "hierarchical"
+        ):
+            alive_num, alive_den, possession_num, possession_den = (
+                hierarchical_loss_components(logits, batch)
+            )
+            loss = alive_num / alive_den
+            if possession_den.item() > 0:
+                loss = loss + model_config.possession_loss_weight * (
+                    possession_num / possession_den
+                )
+            alive_numerator_total += float(alive_num.detach().cpu())
+            alive_denominator_total += float(alive_den.detach().cpu())
+            possession_numerator_total += float(possession_num.detach().cpu())
+            possession_denominator_total += float(possession_den.detach().cpu())
+        else:
+            loss_function = (
+                masked_bce_components
+                if model_config.classification_mode == "binary"
+                else masked_cross_entropy_components
+            )
+            numerator, denominator = loss_function(
+                logits,
+                batch["labels"],
+                batch["supervision_mask"],
+                batch["loss_weight"],
+                batch["label_valid"],
+            )
+            loss = numerator / denominator
+            total_numerator += float(numerator.detach().cpu())
+            total_denominator += float(denominator.detach().cpu())
         loss.backward()
         if gradient_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
         optimizer.step()
-        total_numerator += float(numerator.detach().cpu())
-        total_denominator += float(denominator.detach().cpu())
         if hasattr(batches, "set_postfix"):
-            batches.set_postfix(loss=f"{total_numerator / total_denominator:.4f}")
+            if alive_denominator_total > 0:
+                running = alive_numerator_total / alive_denominator_total
+                if possession_denominator_total > 0:
+                    running += model_config.possession_loss_weight * (
+                        possession_numerator_total / possession_denominator_total
+                    )
+            else:
+                running = total_numerator / total_denominator
+            batches.set_postfix(loss=f"{running:.4f}")
+    if alive_denominator_total > 0:
+        if possession_denominator_total <= 0:
+            raise ValueError("Epoch contains no valid possession targets")
+        alive_loss = alive_numerator_total / alive_denominator_total
+        possession_loss = possession_numerator_total / possession_denominator_total
+        return EpochStats(
+            alive_loss + model_config.possession_loss_weight * possession_loss,
+            alive_denominator_total,
+            alive_loss,
+            possession_loss,
+            alive_denominator_total,
+            possession_denominator_total,
+        )
     if total_denominator <= 0:
         raise ValueError("Epoch produced no valid outputs")
     return EpochStats(total_numerator / total_denominator, total_denominator)
@@ -162,6 +271,8 @@ def validate_full_segments(
     segments: tuple[Segment, ...],
     device: torch.device,
     classification_mode: str,
+    had_head_type: str = "direct",
+    possession_loss_weight: float = 1.0,
     chunk_frames: int | None = None,
     show_progress: bool = False,
     description: str = "Validation",
@@ -169,6 +280,10 @@ def validate_full_segments(
     """Calculate mean validation loss from one prediction per valid frame."""
     total_numerator = 0.0
     total_frames = 0
+    alive_numerator = 0.0
+    alive_frames = 0
+    possession_numerator = 0.0
+    possession_frames = 0
     segment_iter = progress(
         segments,
         enabled=show_progress,
@@ -195,6 +310,34 @@ def validate_full_segments(
         frame_slice = slice(segment.start, segment.end)
         valid = torch.from_numpy(data.label_valid[frame_slice]).bool()
         labels = torch.from_numpy(data.labels[frame_slice])
+        if classification_mode == "had" and had_head_type == "hierarchical":
+            if data.alive_labels is None:
+                raise ValueError("Hierarchical validation targets are unavailable")
+            alive_valid = torch.from_numpy(data.alive_label_valid[frame_slice]).bool()
+            possession_valid = torch.from_numpy(
+                data.possession_label_valid[frame_slice]
+            ).bool()
+            alive_targets = torch.from_numpy(data.alive_labels[frame_slice])
+            possession_targets = torch.from_numpy(data.possession_labels[frame_slice])
+            if alive_valid.any():
+                alive_numerator += float(
+                    F.binary_cross_entropy_with_logits(
+                        logits[alive_valid, 0],
+                        alive_targets[alive_valid].to(logits.dtype),
+                        reduction="sum",
+                    )
+                )
+                alive_frames += int(alive_valid.sum())
+            if possession_valid.any():
+                possession_numerator += float(
+                    F.cross_entropy(
+                        logits[possession_valid, 1:],
+                        possession_targets[possession_valid].long(),
+                        reduction="sum",
+                    )
+                )
+                possession_frames += int(possession_valid.sum())
+            continue
         if not valid.any():
             continue
         if classification_mode == "binary":
@@ -207,6 +350,19 @@ def validate_full_segments(
             raise ValueError("classification_mode must be 'binary' or 'had'")
         total_numerator += float(losses)
         total_frames += int(valid.sum())
+    if classification_mode == "had" and had_head_type == "hierarchical":
+        if alive_frames == 0 or possession_frames == 0:
+            raise ValueError("Validation lacks hierarchical supervision targets")
+        alive_loss = alive_numerator / alive_frames
+        possession_loss = possession_numerator / possession_frames
+        return EpochStats(
+            alive_loss + possession_loss_weight * possession_loss,
+            float(alive_frames),
+            alive_loss,
+            possession_loss,
+            float(alive_frames),
+            float(possession_frames),
+        )
     if total_frames == 0:
         raise ValueError("Validation contains no valid labelled frames")
     return EpochStats(total_numerator / total_frames, float(total_frames))
@@ -286,8 +442,8 @@ def train_experiment(
             loaders.train,
             device,
             optimizer,
+            config.model,
             config.training.gradient_clip_norm,
-            config.model.classification_mode,
             show_progress,
             f"F{config.split.fold} B{config.split.validation_block} epoch {epoch}",
         )
@@ -297,15 +453,17 @@ def train_experiment(
             loaders.split.segments["validation"],
             device,
             config.model.classification_mode,
+            config.model.had_head_type,
+            config.model.possession_loss_weight,
             show_progress=show_progress,
             description=f"F{config.split.fold} B{config.split.validation_block} validation",
         )
         scheduler.step(validation_stats.loss)
         record = {
             "epoch": epoch,
-            "train_loss": train_stats.loss,
-            "validation_loss": validation_stats.loss,
             "learning_rate": optimizer.param_groups[0]["lr"],
+            **_stats_fields("train", train_stats),
+            **_stats_fields("validation", validation_stats),
         }
         history.append(record)
         if hasattr(epochs, "set_postfix"):
@@ -343,6 +501,9 @@ def train_experiment(
         "run_dir": str(run_dir),
         "checkpoint_path": str(checkpoint_path),
         "best_validation_loss": best_validation_loss,
+        "best_validation_stats": min(
+            history, key=lambda item: item["validation_loss"]
+        ),
         "epochs_completed": len(history),
         "best_epoch": min(history, key=lambda item: item["validation_loss"])["epoch"],
     }
@@ -388,16 +549,16 @@ def train_full_half_refit(
             loaders.train,
             device,
             optimizer,
+            config.model,
             config.training.gradient_clip_norm,
-            config.model.classification_mode,
             show_progress,
             f"F{config.split.fold} refit epoch {epoch}",
         )
         history.append(
             {
                 "epoch": epoch,
-                "train_loss": train_stats.loss,
                 "learning_rate": optimizer.param_groups[0]["lr"],
+                **_stats_fields("train", train_stats),
             }
         )
         if hasattr(epoch_iter, "set_postfix"):
@@ -492,7 +653,23 @@ def run_cross_validation(
                 "segment_metrics"
             ]["mean_f1"]
         else:
-            block_result["best_validation_ce"] = training_result["best_validation_loss"]
+            if config.model.had_head_type == "hierarchical":
+                best_stats = training_result["best_validation_stats"]
+                block_result.update(
+                    {
+                        "best_validation_alive_bce": best_stats[
+                            "validation_alive_bce"
+                        ],
+                        "best_validation_possession_ce": best_stats[
+                            "validation_possession_ce"
+                        ],
+                        "possession_loss_weight": config.model.possession_loss_weight,
+                    }
+                )
+            else:
+                block_result["best_validation_ce"] = training_result[
+                    "best_validation_loss"
+                ]
             block_result["possession_spell_mean_f1"] = evaluation.report[
                 "spell_metrics"
             ]["mean_f1"]
@@ -506,6 +683,7 @@ def run_cross_validation(
     summary = {
         "schema_version": "wcsf_temporal_cv_v2",
         "classification_mode": config.model.classification_mode,
+        "had_head_type": config.model.had_head_type,
         "fold": config.split.fold,
         "model_type": config.model.model_type,
         "seed": config.training.seed,
@@ -526,7 +704,30 @@ def run_cross_validation(
             np.mean([item["binary_segment_mean_f1"] for item in block_results])
         )
     else:
-        summary["mean_best_validation_ce"] = summary["mean_best_validation_loss"]
+        if config.model.had_head_type == "hierarchical":
+            summary.update(
+                {
+                    "mean_best_validation_alive_bce": float(
+                        np.mean(
+                            [
+                                item["best_validation_alive_bce"]
+                                for item in block_results
+                            ]
+                        )
+                    ),
+                    "mean_best_validation_possession_ce": float(
+                        np.mean(
+                            [
+                                item["best_validation_possession_ce"]
+                                for item in block_results
+                            ]
+                        )
+                    ),
+                    "possession_loss_weight": config.model.possession_loss_weight,
+                }
+            )
+        else:
+            summary["mean_best_validation_ce"] = summary["mean_best_validation_loss"]
         summary["mean_possession_spell_f1"] = float(
             np.mean([item["possession_spell_mean_f1"] for item in block_results])
         )
@@ -573,6 +774,7 @@ def main() -> None:
     parser.add_argument("--fold", choices=("1", "2", "all"), default="all")
     parser.add_argument("--model-type", choices=("team_tcn", "deepsets_tcn"))
     parser.add_argument("--classification-mode", choices=("binary", "had"))
+    parser.add_argument("--had-head-type", choices=("direct", "hierarchical"))
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
@@ -588,6 +790,8 @@ def main() -> None:
             config.data.label_path = (
                 "data/open_data_groningen/processed/wcsf_had_labels.npz"
             )
+    if args.had_head_type is not None:
+        config.model.had_head_type = args.had_head_type
     config.validate()
     folds = (1, 2) if args.fold == "all" else (int(args.fold),)
     run_dir, summaries = train_run(config, folds, not args.no_progress)

@@ -1,4 +1,4 @@
-"""Noncausal residual TCN and selectable ALIVE/DEAD model frontends."""
+"""Noncausal residual TCN with binary, direct H/A/D and hierarchical heads."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from .config import ModelConfig, receptive_field_frames
-from .player_encoder import DeepSetPlayerEncoder
+from .player_encoder import BallConditionedDeepSetPlayerEncoder, DeepSetPlayerEncoder
 
 
 class ChannelLayerNorm(nn.Module):
@@ -154,7 +154,13 @@ class BaseAliveDeadTCN(nn.Module):
             config.convolutions_per_block,
         )
         self.output_classes = config.output_classes
-        self.classifier = nn.Linear(config.temporal_channels, self.output_classes)
+        self.classification_mode = config.classification_mode
+        self.had_head_type = config.had_head_type
+        if config.classification_mode == "had" and config.had_head_type == "hierarchical":
+            self.alive_classifier = nn.Linear(config.temporal_channels, 1)
+            self.possession_classifier = nn.Linear(config.temporal_channels, 2)
+        else:
+            self.classifier = nn.Linear(config.temporal_channels, self.output_classes)
 
     def temporal_forward(
         self, representation: torch.Tensor, output_mask: torch.Tensor
@@ -162,8 +168,35 @@ class BaseAliveDeadTCN(nn.Module):
         projected = self.input_projection(representation)
         projected = projected * output_mask.unsqueeze(-1).to(projected.dtype)
         temporal = self.temporal(projected.transpose(1, 2), output_mask)
-        logits = self.classifier(temporal.transpose(1, 2))
+        temporal = temporal.transpose(1, 2)
+        if self.classification_mode == "had" and self.had_head_type == "hierarchical":
+            return torch.cat(
+                (self.alive_classifier(temporal), self.possession_classifier(temporal)),
+                dim=-1,
+            )
+        logits = self.classifier(temporal)
         return logits.squeeze(-1) if self.output_classes == 1 else logits
+
+
+def had_probabilities_from_logits(
+    logits: torch.Tensor, had_head_type: str = "direct"
+) -> torch.Tensor:
+    """Convert direct or hierarchical outputs to joint probabilities [H, A, D]."""
+    if logits.ndim < 2 or logits.shape[-1] != 3:
+        raise ValueError("H/A/D outputs must end with three values")
+    if had_head_type == "direct":
+        return torch.softmax(logits, dim=-1)
+    if had_head_type != "hierarchical":
+        raise ValueError("had_head_type must be 'direct' or 'hierarchical'")
+    alive_probability = torch.sigmoid(logits[..., :1])
+    possession_probability = torch.softmax(logits[..., 1:], dim=-1)
+    return torch.cat(
+        (
+            alive_probability * possession_probability,
+            1.0 - alive_probability,
+        ),
+        dim=-1,
+    )
 
 
 class TeamStatisticsTCN(BaseAliveDeadTCN):
@@ -184,22 +217,44 @@ class DeepSetsTCN(BaseAliveDeadTCN):
     """Deep Sets player embeddings fused with team statistics before the TCN."""
 
     def __init__(self, config: ModelConfig) -> None:
+        player_encoder_type = config.player_encoder_type
+        if player_encoder_type == "ball_conditioned":
+            conditioned_encoder = BallConditionedDeepSetPlayerEncoder(
+                config.player_hidden_dim, config.player_embedding_dim
+            )
+            player_input_dim = conditioned_encoder.output_dim
+        else:
+            conditioned_encoder = None
+            player_input_dim = 2 * config.player_embedding_dim
         super().__init__(
-            input_dim=2 * config.player_embedding_dim + 24 + (5 if config.use_ball else 0),
+            input_dim=player_input_dim + 24 + (5 if config.use_ball else 0),
             config=config,
         )
+        self.player_encoder_type = player_encoder_type
         self.use_ball = config.use_ball
-        self.player_encoder = DeepSetPlayerEncoder(
-            config.player_hidden_dim, config.player_embedding_dim
+        self.player_encoder = (
+            conditioned_encoder
+            if conditioned_encoder is not None
+            else DeepSetPlayerEncoder(config.player_hidden_dim, config.player_embedding_dim)
         )
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        player_embeddings = self.player_encoder(
-            batch["players"],
-            batch["player_location_valid"],
-            batch["player_speed_valid"],
-        )
-        parts = [player_embeddings.flatten(-2), _team_representation(batch)]
+        if self.player_encoder_type == "ball_conditioned":
+            player_representation = self.player_encoder(
+                batch["players"],
+                batch["player_location_valid"],
+                batch["player_speed_valid"],
+                batch["ball"],
+                batch["ball_location_valid"],
+            )
+        else:
+            player_embeddings = self.player_encoder(
+                batch["players"],
+                batch["player_location_valid"],
+                batch["player_speed_valid"],
+            )
+            player_representation = player_embeddings.flatten(-2)
+        parts = [player_representation, _team_representation(batch)]
         if self.use_ball:
             parts.append(_ball_representation(batch))
         representation = torch.cat(parts, dim=-1)
@@ -207,6 +262,14 @@ class DeepSetsTCN(BaseAliveDeadTCN):
 
 
 def build_model(config: ModelConfig) -> nn.Module:
+    if config.had_head_type == "hierarchical" and config.classification_mode != "had":
+        raise ValueError("hierarchical heads require classification_mode='had'")
+    if config.player_encoder_type == "ball_conditioned" and (
+        config.model_type != "deepsets_tcn" or not config.use_ball
+    ):
+        raise ValueError(
+            "ball_conditioned encoder requires model_type='deepsets_tcn' and use_ball=true"
+        )
     if config.model_type == "team_tcn":
         return TeamStatisticsTCN(config)
     if config.model_type == "deepsets_tcn":

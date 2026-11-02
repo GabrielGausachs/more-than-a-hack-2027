@@ -25,13 +25,13 @@ from .runs import (
     load_run_metadata,
 )
 from .splits import build_fold_split, build_refit_split, valid_subsegments
-from .tcn import build_model
+from .tcn import build_model, had_probabilities_from_logits
 
 
 DEFAULT_SMOOTHING_WINDOWS = (3, 5, 9, 15, 21, 31, 41)
 DEFAULT_VITERBI_PENALTIES = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 CACHE_SCHEMA_VERSION = "wcsf_had_probability_cache_v1"
-EXPERIMENT_SCHEMA_VERSION = "wcsf_had_temporal_decoding_v1"
+EXPERIMENT_SCHEMA_VERSION = "wcsf_had_temporal_decoding_v2"
 
 
 @dataclass(frozen=True)
@@ -184,19 +184,22 @@ def _metric_summary(metrics: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def evaluate_decoder(
-    block_runs: Mapping[int, Sequence[ProbabilityRun]],
+    block_runs: Mapping[str, Sequence[ProbabilityRun]],
     decoder: Decoder,
     source_fps: float,
 ) -> dict[str, Any]:
-    """Evaluate one candidate equally across the three inner blocks."""
-    if set(block_runs) != {1, 2, 3}:
-        raise ValueError("Decoder selection requires inner blocks 1, 2 and 3")
+    """Evaluate one candidate equally across all six inner-validation blocks."""
+    expected = {
+        f"fold{fold}_block{block}" for fold in (1, 2) for block in (1, 2, 3)
+    }
+    if set(block_runs) != expected:
+        raise ValueError("Global decoder selection requires all six inner blocks")
     block_results: dict[str, Any] = {}
-    for block in (1, 2, 3):
+    for block in sorted(block_runs):
         metrics = compute_had_metrics(
             decode_probability_runs(block_runs[block], decoder), source_fps
         )
-        block_results[str(block)] = _metric_summary(metrics)
+        block_results[block] = _metric_summary(metrics)
     aggregate = {
         "mean_spell_f1": float(
             np.mean(
@@ -264,13 +267,13 @@ def _selection_key(result: Mapping[str, Any], method_rank: int) -> tuple[float, 
     )
 
 
-def select_fold_decoders(
-    block_runs: Mapping[int, Sequence[ProbabilityRun]],
+def select_global_decoders(
+    block_runs: Mapping[str, Sequence[ProbabilityRun]],
     source_fps: float,
     smoothing_windows: Sequence[int] = DEFAULT_SMOOTHING_WINDOWS,
     viterbi_penalties: Sequence[float] = DEFAULT_VITERBI_PENALTIES,
 ) -> tuple[dict[str, Any], dict[str, Decoder]]:
-    """Tune smoothing and Viterbi independently using inner validation only."""
+    """Select one decoder grid result across all six inner-validation blocks."""
     if not smoothing_windows or not viterbi_penalties:
         raise ValueError("Both decoder grids must be non-empty")
     if any(window < 1 or window % 2 == 0 for window in smoothing_windows):
@@ -314,7 +317,8 @@ def select_fold_decoders(
         "selected": from_result(best_overall_result),
     }
     report = {
-        "selection_metric": "mean spell F1 over IoU 0.3-0.7, equally averaged across blocks",
+        "selection_scope": "one global decoder across six inner-validation blocks",
+        "selection_metric": "mean spell F1 over IoU 0.3-0.7, equally averaged across six blocks",
         "tie_breaks": [
             "mean frame macro F1",
             "mean spell F1 at IoU 0.5",
@@ -395,8 +399,18 @@ def _infer_checkpoint_runs(
     )
     if config.model.classification_mode != "had":
         raise ValueError("Temporal decoding requires H/A/D checkpoints")
+    expected_head = metadata.get(
+        "had_head_type",
+        metadata.get("config", {}).get("model", {}).get("had_head_type", "direct"),
+    )
+    if config.model.had_head_type != expected_head:
+        raise ValueError("Checkpoint output head disagrees with run metadata")
     raw = load_wcsf_data(
-        config.data.feature_path, config.data.label_path, "had", config.model.use_ball
+        config.data.feature_path,
+        config.data.label_path,
+        "had",
+        config.model.use_ball,
+        config.model.had_head_type,
     )
     if spec.training_mode == "inner_cv":
         buffer_frames = config.seconds_to_frames(
@@ -432,7 +446,9 @@ def _infer_checkpoint_runs(
         )
         if logits.shape != (segment.length, 3):
             raise ValueError("H/A/D checkpoint produced an unexpected logit shape")
-        probabilities = torch.softmax(logits, dim=-1).to(torch.float32).cpu().numpy()
+        probabilities = had_probabilities_from_logits(
+            logits, config.model.had_head_type
+        ).to(torch.float32).cpu().numpy()
         _validate_probabilities(probabilities)
         for valid_segment in valid_subsegments(segment, data.label_valid):
             local = slice(
@@ -548,7 +564,11 @@ def _validate_cached_timelines(
     """Verify cached bounds and labels against the authoritative source archives."""
     config = ExperimentConfig.from_dict(metadata["config"])
     raw = load_wcsf_data(
-        config.data.feature_path, config.data.label_path, "had", config.model.use_ball
+        config.data.feature_path,
+        config.data.label_path,
+        "had",
+        config.model.use_ball,
+        config.model.had_head_type,
     )
     for spec in specs:
         if spec.training_mode == "inner_cv":
@@ -612,7 +632,7 @@ def _load_or_create_cache(
 
 def _combined_oof_report(
     outer_runs: Mapping[int, Sequence[ProbabilityRun]],
-    selections: Mapping[int, Mapping[str, Decoder]],
+    selections: Mapping[str, Decoder],
     source_fps: float,
 ) -> dict[str, Any]:
     if {run.half_id for run in outer_runs.get(1, ())} != {2} or {
@@ -624,9 +644,9 @@ def _combined_oof_report(
         fold_reports = {}
         combined: list[HADRun] = []
         for fold in (1, 2):
-            decoded = decode_probability_runs(outer_runs[fold], selections[fold][approach])
+            decoded = decode_probability_runs(outer_runs[fold], selections[approach])
             fold_reports[str(fold)] = {
-                "decoder": selections[fold][approach].to_dict(),
+                "decoder": selections[approach].to_dict(),
                 **_metric_summary(compute_had_metrics(decoded, source_fps)),
             }
             combined.extend(decoded)
@@ -637,9 +657,23 @@ def _combined_oof_report(
         }
     return {
         "schema_version": EXPERIMENT_SCHEMA_VERSION,
+        "decoder_scope": "one global decoder applied to both outer folds",
         "oof_mapping": {"half_1": "fold_2", "half_2": "fold_1"},
         "approaches": approaches,
     }
+
+
+def _decoded_oof_runs(
+    outer_runs: Mapping[int, Sequence[ProbabilityRun]],
+    selections: Mapping[str, Decoder],
+    approach: str,
+) -> tuple[HADRun, ...]:
+    runs = [
+        run
+        for fold in (1, 2)
+        for run in decode_probability_runs(outer_runs[fold], selections[approach])
+    ]
+    return tuple(sorted(runs, key=lambda run: run.start))
 
 
 def run_experiment(
@@ -650,6 +684,7 @@ def run_experiment(
     viterbi_penalties: Sequence[float] = DEFAULT_VITERBI_PENALTIES,
     rebuild_cache: bool = False,
     show_progress: bool = True,
+    save_timeline: bool = False,
 ) -> Path:
     run_dir = Path(run_dir).resolve()
     metadata = load_run_metadata(run_dir, "had")
@@ -666,13 +701,14 @@ def run_experiment(
         show_progress,
     )
     source_fps = float(metadata["temporal"]["source_fps"])
-    selection_reports = {}
-    selections = {}
-    for fold in (1, 2):
-        blocks = {block: entries[f"inner_f{fold}_b{block}"] for block in (1, 2, 3)}
-        selection_reports[str(fold)], selections[fold] = select_fold_decoders(
-            blocks, source_fps, smoothing_windows, viterbi_penalties
-        )
+    blocks = {
+        f"fold{fold}_block{block}": entries[f"inner_f{fold}_b{block}"]
+        for fold in (1, 2)
+        for block in (1, 2, 3)
+    }
+    selection_report, selections = select_global_decoders(
+        blocks, source_fps, smoothing_windows, viterbi_penalties
+    )
     outer_runs = {fold: entries[f"outer_f{fold}"] for fold in (1, 2)}
     oof_report = _combined_oof_report(outer_runs, selections, source_fps)
 
@@ -692,18 +728,32 @@ def run_experiment(
         "smoothing_windows": list(smoothing_windows),
         "viterbi_penalties": list(viterbi_penalties),
         "boundary_policy": "decode each half/partition/valid-label run independently",
-        "selection_policy": "fold-specific three-block inner validation only",
+        "selection_policy": "one global decoder selected equally across six inner-validation blocks",
     }
     for filename, values in (
         ("experiment_metadata.json", experiment_metadata),
         (
             "inner_selection.json",
-            {"schema_version": EXPERIMENT_SCHEMA_VERSION, "folds": selection_reports},
+            {"schema_version": EXPERIMENT_SCHEMA_VERSION, **selection_report},
         ),
         ("oof_comparison.json", oof_report),
     ):
         with (experiment_dir / filename).open("w", encoding="utf-8") as handle:
             json.dump(values, handle, indent=2)
+    if save_timeline:
+        from .plotting import HAD_COLORS, save_prediction_comparison_timeline
+
+        save_prediction_comparison_timeline(
+            {
+                name.capitalize(): _decoded_oof_runs(outer_runs, selections, name)
+                for name in ("raw", "smoothing", "viterbi", "selected")
+            },
+            source_fps,
+            experiment_dir / "oof_timeline.png",
+            "WCSF H/A/D temporal decoding",
+            class_names=CLASS_NAMES,
+            class_colors=HAD_COLORS,
+        )
     return experiment_dir
 
 
@@ -719,6 +769,7 @@ def main() -> None:
     )
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--save-timeline", action="store_true")
     args = parser.parse_args()
     output = run_experiment(
         args.run_dir,
@@ -727,6 +778,7 @@ def main() -> None:
         viterbi_penalties=args.viterbi_penalties,
         rebuild_cache=args.rebuild_cache,
         show_progress=not args.no_progress,
+        save_timeline=args.save_timeline,
     )
     with (output / "oof_comparison.json").open(encoding="utf-8") as handle:
         report = json.load(handle)

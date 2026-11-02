@@ -1,0 +1,20 @@
+{
+  "data": {
+    "feature_path": "data/open_data_groningen/processed/wcsf_player_team_ball_features.npz",
+    "label_path": "data/open_data_groningen/processed/wcsf_had_labels.npz",
+    "sequence_seconds": 20.0,
+    "train_stride_seconds": 5.0
+  },
+  "split": {
+    "buffer_seconds": 15.0
+  },
+  "model": {
+    "model_type": "deepsets_tcn",
+    "classification_mode": "had",
+    "use_ball": true,
+    "player_encoder_type": "ball_conditioned",
+    "kernel_size": 3,
+    "dilations": [1, 2, 4, 8, 16],
+    "convolutions_per_block": 2
+  }
+}

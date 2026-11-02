@@ -510,6 +510,18 @@ Masked mean pooling over the player dimension produces separate 32-dimensional H
 embeddings. This makes the player branch permutation-invariant: reordering player slots cannot
 change the pooled representation.
 
+New experiments may explicitly select `player_encoder_type="ball_conditioned"` together with
+`use_ball=true`. This retains the Deep Sets + TCN design but derives masked player-to-ball signed
+displacements and pitch-scaled metric distance before the shared player MLP. Separate Home/Away
+representations concatenate mean, max and learned-attention pooling with nearest-player geometry
+summaries and nearby-player counts. A valid Home-minus-Away nearest-distance margin is also added
+at fusion. These quantities are derived from the existing feature arrays during the forward pass,
+so WCSF and Metrica archives are not duplicated or changed. Missing ball locations invalidate only
+the relative geometry; the absolute-player, team-statistics and global-ball branches remain usable.
+
+The default `legacy_mean` value preserves the historical five-input mean-pooled encoder and allows
+old configurations and checkpoints to deserialize unchanged.
+
 The Home embedding, Away embedding, team features and team validity masks are concatenated and
 projected to the shared temporal channel width. No player IDs, slot embeddings or player-specific
 temporal links are used.
@@ -532,7 +544,10 @@ Configurations D/E add dilation 16 and produce RF 125.
 Output heads:
 
 - Binary mode: one logit per frame, shape `(B,T)`.
-- H/A/D mode: three logits `[H,A,D]` per frame, shape `(B,T,3)`.
+- Direct H/A/D mode: three logits `[H,A,D]` per frame, shape `(B,T,3)`.
+- Optional hierarchical H/A/D mode: one ALIVE logit and two conditional ownership logits
+  `[H|ALIVE,A|ALIVE]`, packed as `(B,T,3)`. Joint probabilities are
+  `p(H/A)=p(ALIVE)*p(H/A|ALIVE)` and `p(D)=1-p(ALIVE)`; classification uses joint argmax.
 
 Because the task is offline, using both past and future context is intentional. The model carries no
 hidden state between windows or disconnected sequences.
@@ -553,8 +568,11 @@ Default optimization settings:
 - Seed 42.
 - CPU/CUDA automatic device selection.
 
-The binary task uses unweighted `BCEWithLogitsLoss` semantics. H/A/D uses unweighted
-cross-entropy. Class weighting is intentionally not applied in the current baseline.
+The binary task uses unweighted `BCEWithLogitsLoss` semantics. Direct H/A/D uses unweighted
+cross-entropy. Hierarchical H/A/D independently normalizes ALIVE BCE and conditional possession
+cross-entropy, then minimizes `alive_BCE + lambda * possession_CE`, with lambda defaulting to 1.0.
+The identical weighted objective is used for full-segment validation and checkpoint selection.
+Class weighting is intentionally not applied in the current baseline.
 
 For a training window, effective per-frame weight is:
 
@@ -728,7 +746,8 @@ visually separated.
 
 Implementation: `modeling/alive_dead/evaluate_had.py`.
 
-H/A/D predictions use `argmax` over logits `[H,A,D]`. Frame evaluation reports:
+Direct H/A/D predictions use `argmax` over softmax probabilities. Hierarchical predictions use
+joint `argmax` over the factorized `[p(H),p(A),p(D)]` probabilities. Frame evaluation reports:
 
 - Accuracy.
 - Per-class H/A/D precision, recall, F1 and support.

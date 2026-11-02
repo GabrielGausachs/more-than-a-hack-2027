@@ -14,7 +14,7 @@ from modeling.alive_dead.postprocess_had import (
     decode_probability_runs,
     load_probability_cache,
     save_probability_cache,
-    select_fold_decoders,
+    select_global_decoders,
     smooth_probabilities,
     viterbi_decode,
 )
@@ -76,17 +76,31 @@ class HADPostprocessingTests(unittest.TestCase):
         expected = HADRun(0, 4, 1, source.labels, np.array([0, 1, 1, 2], dtype=np.int8))
         self.assertEqual(compute_had_metrics(decoded), compute_had_metrics([expected]))
 
-    def test_inner_selection_uses_all_three_blocks(self):
+    def test_global_selection_uses_all_six_inner_blocks(self):
         blocks = {
-            block: (probability_run(block * 10, 1, [0, 0, 1, 1, 2, 2]),)
+            f"fold{fold}_block{block}": (
+                probability_run(fold * 100 + block * 10, fold, [0, 0, 1, 1, 2, 2]),
+            )
+            for fold in (1, 2)
             for block in (1, 2, 3)
         }
-        report, selected = select_fold_decoders(
+        report, selected = select_global_decoders(
             blocks, 10.0, smoothing_windows=(3, 5), viterbi_penalties=(0.0, 1.0)
         )
-        self.assertEqual(set(report["raw"]["blocks"]), {"1", "2", "3"})
+        self.assertEqual(set(report["raw"]["blocks"]), set(blocks))
+        self.assertIn("six inner-validation blocks", report["selection_scope"])
         self.assertEqual(set(selected), {"raw", "smoothing", "viterbi", "selected"})
         self.assertEqual(selected["raw"], Decoder("raw"))
+
+        incomplete = dict(blocks)
+        incomplete.pop("fold2_block3")
+        with self.assertRaisesRegex(ValueError, "six inner blocks"):
+            select_global_decoders(
+                incomplete,
+                10.0,
+                smoothing_windows=(3,),
+                viterbi_penalties=(0.0,),
+            )
 
     def test_probability_cache_round_trip_and_identity_rejection(self):
         identity = {
@@ -110,8 +124,8 @@ class HADPostprocessingTests(unittest.TestCase):
 
     def test_oof_mapping_is_enforced(self):
         selections = {
-            fold: {name: Decoder("raw") for name in ("raw", "smoothing", "viterbi", "selected")}
-            for fold in (1, 2)
+            name: Decoder("raw")
+            for name in ("raw", "smoothing", "viterbi", "selected")
         }
         outer = {
             1: (probability_run(10, 2, [0, 1, 2]),),
@@ -119,6 +133,10 @@ class HADPostprocessingTests(unittest.TestCase):
         }
         report = _combined_oof_report(outer, selections, 10.0)
         self.assertEqual(report["oof_mapping"], {"half_1": "fold_2", "half_2": "fold_1"})
+        self.assertEqual(
+            report["approaches"]["selected"]["folds"]["1"]["decoder"],
+            report["approaches"]["selected"]["folds"]["2"]["decoder"],
+        )
         with self.assertRaisesRegex(ValueError, "Fold 2 for H1"):
             _combined_oof_report({1: outer[2], 2: outer[1]}, selections, 10.0)
 

@@ -7,7 +7,12 @@ from pathlib import Path
 import numpy as np
 
 from modeling.alive_dead.evaluate import PredictionRun, score_prediction_runs
-from modeling.alive_dead.plotting import _group_runs_by_half, save_prediction_timeline
+from modeling.alive_dead.plotting import (
+    HAD_COLORS,
+    _group_runs_by_half,
+    save_prediction_comparison_timeline,
+    save_prediction_timeline,
+)
 
 
 def prediction_run(start, labels, predictions=None, half_id=1):
@@ -73,6 +78,39 @@ class PredictionTimelineTests(unittest.TestCase):
         for run, (labels, predictions) in zip(runs, values_before):
             np.testing.assert_array_equal(run.labels, labels)
             np.testing.assert_array_equal(run.predictions, predictions)
+
+    def test_had_comparison_timeline_and_alignment(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("Matplotlib is not installed")
+
+        labels = np.array([0, 0, 1, 2], dtype=np.int8)
+        raw = PredictionRun(0, 4, 1, labels, np.array([0, 1, 1, 2], dtype=np.int8))
+        decoded = PredictionRun(0, 4, 1, labels, labels.copy())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "had_timeline.png"
+            save_prediction_comparison_timeline(
+                {"Raw": [raw], "Viterbi": [decoded]},
+                10.0,
+                path,
+                "H/A/D",
+                class_names=("H", "A", "D"),
+                class_colors=HAD_COLORS,
+            )
+            self.assertTrue(path.is_file())
+            self.assertGreater(path.stat().st_size, 0)
+
+        misaligned = PredictionRun(1, 5, 1, labels, labels.copy())
+        with self.assertRaisesRegex(ValueError, "not timeline-aligned"):
+            save_prediction_comparison_timeline(
+                {"Raw": [raw], "Other": [misaligned]},
+                10.0,
+                "unused.png",
+                "H/A/D",
+                class_names=("H", "A", "D"),
+                class_colors=HAD_COLORS,
+            )
 
 
 if __name__ == "__main__":

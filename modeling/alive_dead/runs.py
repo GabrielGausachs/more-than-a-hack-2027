@@ -52,6 +52,7 @@ def build_run_metadata(
         "status": status,
         "task": task_name(config),
         "model_type": config.model.model_type,
+        "had_head_type": config.model.had_head_type,
         "seed": config.training.seed,
         "folds_requested": list(folds),
         "folds_completed": [],
@@ -62,6 +63,8 @@ def build_run_metadata(
             "players": True,
             "team_statistics": True,
             "ball": config.model.use_ball,
+            "player_encoder_type": config.model.player_encoder_type,
+            "player_ball_geometry": config.model.player_encoder_type == "ball_conditioned",
             "feature_archive": config.data.feature_path,
         },
         "temporal": {
@@ -82,6 +85,22 @@ def build_run_metadata(
             "normalization": "fit on training frames only; saved with each checkpoint",
             "validation_inference": "one prediction per frame from contiguous segments",
             "refit": "complete outer training half for median inner best epoch",
+            "output_head": (
+                "shared ALIVE head plus conditional H/A possession head"
+                if config.model.had_head_type == "hierarchical"
+                else "single direct classification head"
+            ),
+            "loss": (
+                "alive_bce + possession_loss_weight * conditional_possession_ce"
+                if config.model.had_head_type == "hierarchical"
+                else "binary BCE or direct H/A/D cross-entropy"
+            ),
+            "possession_loss_weight": config.model.possession_loss_weight,
+            "had_probability_factorization": (
+                "p(H/A)=p(ALIVE)*p(H/A|ALIVE); p(D)=1-p(ALIVE)"
+                if config.model.had_head_type == "hierarchical"
+                else None
+            ),
         },
         "config": config.to_dict(),
     }

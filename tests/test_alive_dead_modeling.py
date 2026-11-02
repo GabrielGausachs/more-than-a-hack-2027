@@ -20,12 +20,18 @@ from modeling.alive_dead.dataset import (
     load_wcsf_data,
 )
 from modeling.alive_dead.inference import predict_segment_logits
-from modeling.alive_dead.player_encoder import DeepSetPlayerEncoder
+from modeling.alive_dead.player_encoder import (
+    BallConditionedDeepSetPlayerEncoder,
+    DeepSetPlayerEncoder,
+    PITCH_DIAGONAL_M,
+    player_ball_geometry,
+)
 from modeling.alive_dead.progress import progress
 from modeling.alive_dead.preprocessing import FeatureNormalizer
 from modeling.alive_dead.splits import Segment, build_fold_split, build_refit_split
-from modeling.alive_dead.tcn import build_model
+from modeling.alive_dead.tcn import build_model, had_probabilities_from_logits
 from modeling.alive_dead.train import (
+    hierarchical_loss_components,
     masked_bce_components,
     masked_cross_entropy_components,
     validate_full_segments,
@@ -239,6 +245,129 @@ class ModelTests(unittest.TestCase):
         )
         torch.testing.assert_close(original, permuted)
 
+    def test_player_ball_geometry_uses_pitch_dimensions_and_masks(self):
+        players = torch.zeros(1, 1, 2, 24, 3)
+        players[0, 0, 0, 0, :2] = torch.tensor([0.6, 0.7])
+        players[0, 0, 1, 0, :2] = torch.tensor([0.4, 0.3])
+        location_valid = torch.zeros(1, 1, 2, 24, dtype=torch.bool)
+        location_valid[..., 0] = True
+        ball = torch.tensor([[[0.5, 0.5, 0.0]]])
+        ball_valid = torch.tensor([[True]])
+        relative, distance_m, valid = player_ball_geometry(
+            players, location_valid, ball, ball_valid
+        )
+        expected_distance = ((0.1 * 105.0) ** 2 + (0.2 * 68.0) ** 2) ** 0.5
+        self.assertAlmostEqual(float(distance_m[0, 0, 0, 0]), expected_distance, places=5)
+        self.assertAlmostEqual(
+            float(relative[0, 0, 0, 0, 2]), expected_distance / PITCH_DIAGONAL_M, places=6
+        )
+        self.assertTrue(valid[0, 0, 0, 0])
+        self.assertEqual(int(torch.count_nonzero(relative[..., 1:, :])), 0)
+
+        relative_missing, distance_missing, valid_missing = player_ball_geometry(
+            players, location_valid, ball, torch.tensor([[False]])
+        )
+        self.assertEqual(int(torch.count_nonzero(relative_missing)), 0)
+        self.assertEqual(int(torch.count_nonzero(distance_missing)), 0)
+        self.assertFalse(valid_missing.any())
+
+    def test_ball_conditioned_encoder_is_permutation_invariant(self):
+        torch.manual_seed(11)
+        encoder = BallConditionedDeepSetPlayerEncoder().eval()
+        batch = self._batch(batch_size=2, length=5)
+        permutation = torch.randperm(24)
+        original = encoder(
+            batch["players"], batch["player_location_valid"],
+            batch["player_speed_valid"], batch["ball"],
+            batch["ball_location_valid"],
+        )
+        permuted = encoder(
+            batch["players"][..., permutation, :],
+            batch["player_location_valid"][..., permutation],
+            batch["player_speed_valid"][..., permutation],
+            batch["ball"], batch["ball_location_valid"],
+        )
+        self.assertEqual(original.shape[-1], encoder.output_dim)
+        torch.testing.assert_close(original, permuted, rtol=1e-5, atol=1e-6)
+
+    def test_ball_conditioned_encoder_handles_empty_and_missing_ball_sets(self):
+        encoder = BallConditionedDeepSetPlayerEncoder().eval()
+        players = torch.zeros(1, 2, 2, 24, 3)
+        location_valid = torch.zeros(1, 2, 2, 24, dtype=torch.bool)
+        speed_valid = torch.zeros_like(location_valid)
+        ball = torch.zeros(1, 2, 3)
+        ball_location_valid = torch.tensor([[False, True]])
+        output = encoder(
+            players, location_valid, speed_valid, ball, ball_location_valid
+        )
+        self.assertEqual(output.shape, (1, 2, encoder.output_dim))
+        self.assertTrue(torch.isfinite(output).all())
+        torch.testing.assert_close(output, torch.zeros_like(output))
+
+    def test_ball_conditioned_geometry_summaries_ignore_padding_and_missing_speed(self):
+        encoder = BallConditionedDeepSetPlayerEncoder(embedding_dim=2).eval()
+        players = torch.zeros(1, 1, 2, 24, 3)
+        players[0, 0, 0, 0, 0] = 0.5 + 1.0 / 105.0
+        players[0, 0, 0, 1, 0] = 0.5 + 4.0 / 105.0
+        players[0, 0, 0, :2, 1] = 0.5
+        players[0, 0, 1, 0, 0] = 0.5 - 2.0 / 105.0
+        players[0, 0, 1, 0, 1] = 0.5
+        location_valid = torch.zeros(1, 1, 2, 24, dtype=torch.bool)
+        location_valid[0, 0, 0, :2] = True
+        location_valid[0, 0, 1, 0] = True
+        speed_valid = torch.zeros_like(location_valid)
+        speed_valid[0, 0, 0, 0] = True
+        ball = torch.tensor([[[0.5, 0.5, 0.0]]])
+        output = encoder(
+            players, location_valid, speed_valid, ball, torch.tensor([[True]])
+        )
+        summary_start = 3 * encoder.embedding_dim
+        home = output[..., : encoder.team_output_dim]
+        summary = home[..., summary_start:]
+        self.assertAlmostEqual(float(summary[..., 0]), 1.0 / PITCH_DIAGONAL_M, places=6)
+        self.assertAlmostEqual(float(summary[..., 1]), 4.0 / PITCH_DIAGONAL_M, places=6)
+        torch.testing.assert_close(
+            summary[..., 2:], torch.tensor([[[1.0, 1.0, 2.0, 2.0, 1.0, 1.0]]])
+        )
+        away_start = encoder.team_output_dim
+        away_summary = output[
+            ..., away_start + summary_start : away_start + encoder.team_output_dim
+        ]
+        self.assertAlmostEqual(float(away_summary[..., 0]), 2.0 / PITCH_DIAGONAL_M, places=6)
+        self.assertEqual(float(away_summary[..., 1]), 0.0)
+        self.assertEqual(float(away_summary[..., -2]), 1.0)
+        self.assertEqual(float(away_summary[..., -1]), 0.0)
+
+    def test_ball_conditioned_model_supports_binary_and_had(self):
+        batch = self._batch()
+        for mode in ("binary", "had"):
+            model = build_model(
+                ModelConfig(
+                    model_type="deepsets_tcn",
+                    classification_mode=mode,
+                    use_ball=True,
+                    player_encoder_type="ball_conditioned",
+                )
+            ).eval()
+            with torch.no_grad():
+                logits = model(batch)
+            expected = batch["labels"].shape if mode == "binary" else (*batch["labels"].shape, 3)
+            self.assertEqual(logits.shape, expected)
+            self.assertTrue(torch.isfinite(logits).all())
+
+    def test_ball_conditioned_encoder_requires_ball_deepsets_model(self):
+        with self.assertRaisesRegex(ValueError, "requires"):
+            build_model(ModelConfig(player_encoder_type="ball_conditioned"))
+
+    def test_legacy_config_defaults_to_original_player_encoder(self):
+        config = ExperimentConfig.from_dict(
+            {"model": {"model_type": "deepsets_tcn", "use_ball": True}}
+        )
+        self.assertEqual(config.model.player_encoder_type, "legacy_mean")
+        self.assertEqual(config.model.had_head_type, "direct")
+        self.assertEqual(config.model.possession_loss_weight, 1.0)
+        self.assertIsInstance(build_model(config.model).player_encoder, DeepSetPlayerEncoder)
+
     def test_both_models_produce_finite_sequence_logits_and_loss(self):
         batch = self._batch()
         for model_type in ("team_tcn", "deepsets_tcn"):
@@ -278,6 +407,71 @@ class ModelTests(unittest.TestCase):
                 batch["label_valid"],
             )
             self.assertTrue(torch.isfinite(numerator / denominator))
+
+    def test_hierarchical_heads_and_joint_probabilities(self):
+        batch = self._batch()
+        for model_type in ("team_tcn", "deepsets_tcn"):
+            config = ModelConfig(
+                model_type=model_type,
+                classification_mode="had",
+                had_head_type="hierarchical",
+            )
+            model = build_model(config).eval()
+            self.assertFalse(hasattr(model, "classifier"))
+            self.assertTrue(hasattr(model, "alive_classifier"))
+            self.assertTrue(hasattr(model, "possession_classifier"))
+            with torch.no_grad():
+                logits = model(batch)
+                probabilities = had_probabilities_from_logits(
+                    logits, "hierarchical"
+                )
+            self.assertEqual(logits.shape, (*batch["labels"].shape, 3))
+            torch.testing.assert_close(
+                probabilities.sum(dim=-1), torch.ones_like(probabilities[..., 0])
+            )
+            self.assertTrue((probabilities >= 0).all())
+
+        logits = torch.tensor([[0.0, 2.0, 0.0]])
+        probabilities = had_probabilities_from_logits(logits, "hierarchical")
+        conditional = torch.softmax(logits[:, 1:], dim=-1)
+        torch.testing.assert_close(probabilities[:, :2], 0.5 * conditional)
+        torch.testing.assert_close(probabilities[:, 2], torch.tensor([0.5]))
+        self.assertEqual(int(probabilities.argmax(dim=-1)), 2)
+
+    def test_hierarchical_loss_masks_possession_without_masking_alive(self):
+        logits = torch.zeros((1, 3, 3), requires_grad=True)
+        batch = {
+            "alive_labels": torch.tensor([[1.0, 1.0, 0.0]]),
+            "alive_label_valid": torch.tensor([[True, True, True]]),
+            "possession_labels": torch.tensor([[0.0, -1.0, -1.0]]),
+            "possession_label_valid": torch.tensor([[True, False, False]]),
+            "supervision_mask": torch.tensor([[True, True, True]]),
+            "loss_weight": torch.ones((1, 3)),
+        }
+        alive_num, alive_den, possession_num, possession_den = (
+            hierarchical_loss_components(logits, batch)
+        )
+        loss = alive_num / alive_den + possession_num / possession_den
+        loss.backward()
+        self.assertEqual(float(alive_den), 3.0)
+        self.assertEqual(float(possession_den), 1.0)
+        self.assertNotEqual(float(logits.grad[0, 1, 0]), 0.0)
+        torch.testing.assert_close(
+            logits.grad[0, 1:, 1:], torch.zeros_like(logits.grad[0, 1:, 1:])
+        )
+
+        no_possession = {**batch}
+        no_possession["possession_label_valid"] = torch.zeros_like(
+            batch["possession_label_valid"]
+        )
+        no_possession["possession_labels"] = torch.full_like(
+            batch["possession_labels"], -1
+        )
+        _, _, empty_numerator, empty_denominator = hierarchical_loss_components(
+            logits.detach().requires_grad_(True), no_possession
+        )
+        self.assertEqual(float(empty_numerator), 0.0)
+        self.assertEqual(float(empty_denominator), 0.0)
 
     def test_ball_enabled_binary_and_had_models(self):
         batch = self._batch()
@@ -408,6 +602,32 @@ class FullSegmentValidationTests(unittest.TestCase):
         chunked = predict_segment_logits(*arguments, chunk_frames=9, **kwargs)
         torch.testing.assert_close(whole, chunked, rtol=1e-5, atol=1e-6)
 
+    def test_hierarchical_chunked_and_whole_segment_logits_match(self):
+        data = synthetic_data(40)
+        segment = Segment(3, 37, "validation", 1)
+        model = build_model(
+            ModelConfig(
+                classification_mode="had",
+                had_head_type="hierarchical",
+                dilations=(1, 2),
+                convolutions_per_block=1,
+                dropout=0.0,
+            )
+        ).eval()
+        arguments = (
+            model,
+            data.players,
+            data.player_location_valid,
+            data.player_speed_valid,
+            data.team_features,
+            data.team_feature_valid,
+            segment,
+            torch.device("cpu"),
+        )
+        whole = predict_segment_logits(*arguments)
+        chunked = predict_segment_logits(*arguments, chunk_frames=9)
+        torch.testing.assert_close(whole, chunked, rtol=1e-5, atol=1e-6)
+
     def test_binary_validation_loss_counts_each_valid_frame_once(self):
         torch.manual_seed(5)
         data = synthetic_data(30)
@@ -475,6 +695,72 @@ class FullSegmentValidationTests(unittest.TestCase):
         self.assertEqual(stats.effective_frames, 15)
         self.assertTrue(np.isfinite(stats.loss))
 
+    def test_hierarchical_validation_uses_same_weighted_objective(self):
+        torch.manual_seed(7)
+        data = synthetic_data(20)
+        alive = (np.arange(20) % 3 != 2).astype(np.int8)
+        possession_valid = alive.astype(bool)
+        possession = np.full(20, -1, dtype=np.int8)
+        possession[possession_valid] = (np.arange(20)[possession_valid] % 2).astype(
+            np.int8
+        )
+        data = WCSFData(
+            **{
+                **data.__dict__,
+                "alive_labels": alive,
+                "alive_label_valid": np.ones(20, dtype=bool),
+                "possession_labels": possession,
+                "possession_label_valid": possession_valid,
+            }
+        )
+        segment = Segment(2, 18, "validation", 1)
+        model = build_model(
+            ModelConfig(
+                classification_mode="had",
+                had_head_type="hierarchical",
+                dilations=(1,),
+                convolutions_per_block=1,
+                dropout=0.0,
+            )
+        ).eval()
+        weight = 1.7
+        stats = validate_full_segments(
+            model,
+            data,
+            (segment,),
+            torch.device("cpu"),
+            "had",
+            "hierarchical",
+            weight,
+        )
+        logits = predict_segment_logits(
+            model,
+            data.players,
+            data.player_location_valid,
+            data.player_speed_valid,
+            data.team_features,
+            data.team_feature_valid,
+            segment,
+            torch.device("cpu"),
+        )
+        frame_slice = slice(segment.start, segment.end)
+        alive_target = torch.from_numpy(data.alive_labels[frame_slice]).float()
+        possession_mask = torch.from_numpy(data.possession_label_valid[frame_slice])
+        possession_target = torch.from_numpy(data.possession_labels[frame_slice])
+        alive_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits[:, 0], alive_target
+        )
+        possession_loss = torch.nn.functional.cross_entropy(
+            logits[possession_mask, 1:], possession_target[possession_mask].long()
+        )
+        self.assertAlmostEqual(
+            stats.loss, float(alive_loss + weight * possession_loss), places=6
+        )
+        self.assertAlmostEqual(stats.alive_loss, float(alive_loss), places=6)
+        self.assertAlmostEqual(
+            stats.possession_loss, float(possession_loss), places=6
+        )
+
 
 class RealArchiveLoadingTests(unittest.TestCase):
     def test_existing_archives_load_without_label_provenance(self):
@@ -499,10 +785,23 @@ class RealArchiveLoadingTests(unittest.TestCase):
             self.skipTest("Strict processed WCSF archives are unavailable")
         strict = load_wcsf_data(feature_path, strict_path, "binary")
         had = load_wcsf_data(feature_path, had_path, "had")
+        hierarchical = load_wcsf_data(
+            feature_path, had_path, "had", had_head_type="hierarchical"
+        )
         self.assertEqual(np.count_nonzero(~strict.label_valid), 39)
         self.assertEqual(np.count_nonzero(~had.label_valid), 110)
         self.assertTrue(np.all(strict.labels[~strict.label_valid] == -1))
         self.assertTrue(np.all(had.labels[~had.label_valid] == -1))
+        self.assertEqual(np.count_nonzero(hierarchical.alive_label_valid), 57335)
+        self.assertEqual(
+            np.count_nonzero(hierarchical.possession_label_valid), 30488
+        )
+        self.assertEqual(
+            np.count_nonzero(
+                hierarchical.alive_label_valid & ~hierarchical.label_valid
+            ),
+            71,
+        )
 
     def test_refit_normalizer_uses_complete_training_half_only(self):
         root = Path(__file__).resolve().parents[1]
@@ -627,6 +926,9 @@ class TimestampedRunTests(unittest.TestCase):
             self.assertEqual(metadata["temporal"]["receptive_field_frames"], 125)
             self.assertEqual(metadata["temporal"]["context_radius_frames"], 62)
             self.assertEqual(metadata["temporal"]["buffer_frames"], 150)
+            self.assertEqual(
+                metadata["input_features"]["player_encoder_type"], "legacy_mean"
+            )
             with self.assertRaises(FileExistsError):
                 create_run_directory(config, (1, 2), created)
 

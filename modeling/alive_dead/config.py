@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -37,7 +38,10 @@ class SplitConfig:
 class ModelConfig:
     model_type: str = "team_tcn"
     classification_mode: str = "binary"
+    had_head_type: str = "direct"
+    possession_loss_weight: float = 1.0
     use_ball: bool = False
+    player_encoder_type: str = "legacy_mean"
     temporal_channels: int = 64
     player_hidden_dim: int = 32
     player_embedding_dim: int = 32
@@ -97,8 +101,35 @@ class ExperimentConfig:
             raise ValueError("model_type must be 'team_tcn' or 'deepsets_tcn'")
         if self.model.classification_mode not in ("binary", "had"):
             raise ValueError("classification_mode must be 'binary' or 'had'")
+        if self.model.had_head_type not in ("direct", "hierarchical"):
+            raise ValueError("had_head_type must be 'direct' or 'hierarchical'")
+        if (
+            self.model.classification_mode != "had"
+            and self.model.had_head_type != "direct"
+        ):
+            raise ValueError("hierarchical heads require classification_mode='had'")
+        if not math.isfinite(self.model.possession_loss_weight) or (
+            self.model.possession_loss_weight <= 0.0
+        ):
+            raise ValueError("possession_loss_weight must be positive")
+        if (
+            self.model.had_head_type != "hierarchical"
+            and self.model.possession_loss_weight != 1.0
+        ):
+            raise ValueError(
+                "possession_loss_weight is configurable only for hierarchical H/A/D"
+            )
         if not isinstance(self.model.use_ball, bool):
             raise ValueError("use_ball must be Boolean")
+        if self.model.player_encoder_type not in ("legacy_mean", "ball_conditioned"):
+            raise ValueError(
+                "player_encoder_type must be 'legacy_mean' or 'ball_conditioned'"
+            )
+        if self.model.player_encoder_type == "ball_conditioned":
+            if self.model.model_type != "deepsets_tcn":
+                raise ValueError("ball_conditioned encoder requires model_type='deepsets_tcn'")
+            if not self.model.use_ball:
+                raise ValueError("ball_conditioned encoder requires use_ball=true")
         if self.model.kernel_size < 1 or self.model.kernel_size % 2 == 0:
             raise ValueError("kernel_size must be a positive odd integer")
         if self.model.convolutions_per_block < 1 or not self.model.dilations:

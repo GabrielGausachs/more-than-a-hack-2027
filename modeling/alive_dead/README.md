@@ -37,7 +37,8 @@ Ball-enabled experiments instead use
     "feature_path": "data/open_data_groningen/processed/wcsf_player_team_ball_features.npz"
   },
   "model": {
-    "use_ball": true
+    "use_ball": true,
+    "player_encoder_type": "ball_conditioned"
   }
 }
 ```
@@ -108,21 +109,36 @@ The final refit normalizer uses the complete training half:
 The fitted parameters are stored in checkpoints. Inner validation/buffer/test frames never enter
 inner normalization, and outer test frames never enter refit normalization.
 
+Configuration D with the ball-conditioned H/A/D frontend is provided at
+`configs/alive_dead/temporal_d_rf125_seq20_ball_conditioned.json`.
+
+```powershell
+python -m modeling.alive_dead.train --config configs/alive_dead/temporal_d_rf125_seq20_ball_conditioned.json --fold all
+```
+
 ## Models
 
 `team_tcn` flattens Home/Away team statistics and masks, projects them to 64 temporal channels and
 applies the TCN.
 
-`deepsets_tcn` additionally applies one shared `5 -> 32 -> 32` MLP to every player. Its five inputs
+By default, `deepsets_tcn` applies one shared `5 -> 32 -> 32` MLP to every player. Its five inputs
 are X, Y, speed, location validity and speed validity. Masked mean pooling separately creates Home
 and Away embeddings, making the branch invariant to player-slot permutations. These embeddings are
 fused with the same team inputs before the shared TCN type.
 
+The opt-in `player_encoder_type="ball_conditioned"` frontend requires `deepsets_tcn` and
+`use_ball=true`. It derives player-to-ball `dx`, `dy` and pitch-scaled metric distance directly
+from the existing arrays, masks them whenever either location is invalid, and exposes them to the
+shared player MLP before pooling. Each team is represented by masked mean, max and learned-attention
+pooling plus nearest/second-nearest distance, counts within 2/3/5 metres, tracked count and validity
+flags. The fusion also receives the valid Home-minus-Away nearest-distance margin. Geometry is not
+stored redundantly in the feature archive and uses identical calculations for WCSF and Metrica.
+
 Both produce one logit per frame with shape `(B,T)`.
 
-With `use_ball=true`, both frontends also concatenate
+With `use_ball=true`, both model frontends also concatenate
 `[ball_x, ball_y, normalized_ball_speed, location_valid, speed_valid]` before the temporal
-projection. No ball distances, interpolation or separate ball encoder are used.
+projection. No interpolation or separate ball encoder is used.
 
 The default TCN has four residual blocks, dilations `[1,2,4,8]`, two noncausal kernel-3
 convolutions per block and 64 channels. Its receptive field is:
@@ -300,6 +316,7 @@ the H/A/D archive when no JSON config is supplied):
 python -m modeling.alive_dead.train --fold all --model-type deepsets_tcn --classification-mode had
 python -m modeling.alive_dead.evaluate_had --run-dir <had-run-folder> --fold 1 --partition test
 python -m modeling.alive_dead.evaluate_had --run-dir <had-run-folder> --fold all
+python -m modeling.alive_dead.evaluate_had --run-dir <had-run-folder> --fold all --save-timeline
 ```
 
 The evaluator reads task, architecture and seed from `run_metadata.json`; it does not reconstruct
@@ -310,19 +327,47 @@ confusion matrix, and the official one-to-one possession-spell F1 at IoUs 0.3 th
 Fragmentation and transition diagnostics use explicit valid runs and 10 Hz tolerances of 5 and
 10 frames. Neither spells nor transitions cross halftime or an invalid-label gap.
 
+### Optional hierarchical H/A/D heads
+
+H/A/D experiments may instead set `"had_head_type": "hierarchical"`. The frontend and TCN
+remain shared, but the output consists of one ALIVE logit and two conditional `[H,A]` logits.
+The strict H/A/D archive already contains the vote provenance needed to derive 57,335 valid
+ALIVE/DEAD targets and 30,488 valid ownership targets, so no new label archive is required.
+
+Training and full-segment validation use the same independently normalized objective:
+
+```text
+alive_BCE + possession_loss_weight * possession_CE
+```
+
+The default possession weight is 1.0. Inference constructs joint probabilities as
+`p(H/A)=p(ALIVE)*p(H/A|ALIVE)` and `p(D)=1-p(ALIVE)`, then uses joint argmax. Configuration D
+with the ball-conditioned frontend is provided at
+`configs/alive_dead/temporal_d_rf125_seq20_ball_conditioned_hierarchical.json`.
+
+```powershell
+python -m modeling.alive_dead.train --config configs/alive_dead/temporal_d_rf125_seq20_ball_conditioned_hierarchical.json --fold all
+```
+
+Omitting `had_head_type`, or setting it to `direct`, preserves the original single H/A/D head.
+
 ### H/A/D temporal postprocessing
 
 Temporal postprocessing can be tuned without retraining or using an outer test half:
 
 ```powershell
 python -m modeling.alive_dead.postprocess_had --run-dir <completed-had-run-folder>
+python -m modeling.alive_dead.postprocess_had --run-dir <completed-had-run-folder> --save-timeline
 ```
 
-For each outer fold, the command selects a centered probability-smoothing window and a symmetric
-Viterbi transition penalty using only that fold's three inner-validation checkpoints. It then
-applies the selected values unchanged to the corresponding refit model's held-out half and
-compares raw argmax, smoothing, Viterbi and the validation-selected overall decoder in combined
-OOF results.
+The command evaluates every smoothing window and Viterbi transition penalty equally across all
+six inner-validation blocks. It selects one global decoder using mean spell F1, applies that same
+frozen decoder to both refit models' held-out halves, and compares raw argmax, smoothing, Viterbi
+and the globally selected decoder in combined OOF results.
+
+With `--save-timeline`, ordinary H/A/D evaluation saves `evaluation/oof_timeline.png` (or a
+fold-specific equivalent). Postprocessing saves `oof_timeline.png` in its timestamped experiment
+directory with aligned Ground truth, Raw, Smoothing, Viterbi and Selected bands.
 
 Decoding restarts at halftime, partition boundaries and invalid-label gaps. The checkpoint-bound
 probability cache is stored at `postprocessing/probabilities.npz`; timestamped experiment reports

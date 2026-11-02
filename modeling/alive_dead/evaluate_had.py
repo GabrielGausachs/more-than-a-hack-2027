@@ -1,4 +1,4 @@
-"""Checkpoint evaluation for direct WCSF Home/Away/Dead classification."""
+"""Checkpoint evaluation for direct or hierarchical WCSF H/A/D classification."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from .splits import (
     build_refit_split,
     valid_subsegments,
 )
-from .tcn import build_model
+from .tcn import build_model, had_probabilities_from_logits
 
 
 CLASS_NAMES = ("H", "A", "D")
@@ -84,7 +84,10 @@ def _predict_valid_runs(
     )
     if logits.shape != (segment.length, 3) or not torch.isfinite(logits).all():
         raise ValueError("H/A/D model produced invalid segment logits")
-    predictions = logits.argmax(dim=-1).to(torch.int8).cpu().numpy()
+    probabilities = had_probabilities_from_logits(
+        logits, getattr(model, "had_head_type", "direct")
+    )
+    predictions = probabilities.argmax(dim=-1).to(torch.int8).cpu().numpy()
 
     return tuple(
         HADRun(
@@ -250,6 +253,7 @@ def evaluate_had_checkpoint(
         config.data.label_path,
         "had",
         config.model.use_ball,
+        config.model.had_head_type,
     )
     if training_mode == "full_half_refit":
         split = build_refit_split(raw.half_id, expected_fold)
@@ -299,6 +303,7 @@ def evaluate_had_checkpoint(
         "checkpoint": str(path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "class_order": list(CLASS_NAMES),
+        "had_head_type": config.model.had_head_type,
         "source_fps": raw.source_fps,
         "n_invalid_labels_in_partition": int(
             np.count_nonzero(getattr(split, f"{partition}_mask") & ~raw.label_valid)
@@ -322,14 +327,18 @@ def evaluate_had_checkpoint(
     )
 
 
-def evaluate_had_oof(
+def _evaluate_had_oof_with_runs(
     run_dir: str | Path,
     device_name: str = "auto",
     show_progress: bool = False,
-) -> Dict[str, object]:
+) -> tuple[Dict[str, object], tuple[HADRun, ...]]:
     metadata = load_run_metadata(run_dir, "had")
     model_type = str(metadata["model_type"])
     seed = int(metadata["seed"])
+    expected_head = metadata.get(
+        "had_head_type",
+        metadata.get("config", {}).get("model", {}).get("had_head_type", "direct"),
+    )
     fold1 = evaluate_had_checkpoint(
         fold_checkpoint_path(run_dir, 1),
         1, model_type, seed, "test", device_name,
@@ -342,6 +351,10 @@ def evaluate_had_oof(
     )
     if not np.array_equal(fold1.label_valid, fold2.label_valid):
         raise ValueError("OOF H/A/D checkpoints use different label masks")
+    if fold1.report["had_head_type"] != fold2.report["had_head_type"]:
+        raise ValueError("OOF H/A/D checkpoints use different output heads")
+    if fold1.report["had_head_type"] != expected_head:
+        raise ValueError("Checkpoint output head disagrees with run metadata")
     if {run.half_id for run in fold1.runs} != {2} or {
         run.half_id for run in fold2.runs
     } != {1}:
@@ -352,12 +365,13 @@ def evaluate_had_oof(
         coverage[run.start : run.end] += 1
     if not np.array_equal(coverage, fold1.label_valid.astype(np.int8)):
         raise ValueError("OOF H/A/D predictions must cover every valid frame once")
-    return {
+    report = {
         "schema_version": "wcsf_had_evaluation_v1",
         "evaluation_type": "combined_oof",
         "model_type": model_type,
         "seed": seed,
         "class_order": list(CLASS_NAMES),
+        "had_head_type": fold1.report["had_head_type"],
         "source_fps": fold1.source_fps,
         "fold_results": {"1": fold1.report, "2": fold2.report},
         "combined": {
@@ -368,6 +382,16 @@ def evaluate_had_oof(
             **compute_had_metrics(runs, fold1.source_fps),
         },
     }
+    return report, runs
+
+
+def evaluate_had_oof(
+    run_dir: str | Path,
+    device_name: str = "auto",
+    show_progress: bool = False,
+) -> Dict[str, object]:
+    report, _ = _evaluate_had_oof_with_runs(run_dir, device_name, show_progress)
+    return report
 
 
 def main() -> None:
@@ -378,17 +402,22 @@ def main() -> None:
     parser.add_argument("--inner-block", type=int, choices=(1, 2, 3))
     parser.add_argument("--device", default="auto")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--save-timeline", action="store_true")
     args = parser.parse_args()
     metadata = load_run_metadata(args.run_dir, "had")
     model_type = str(metadata["model_type"])
     seed = int(metadata["seed"])
     output_dir = evaluation_dir(args.run_dir)
     show_progress = not args.no_progress
+    timeline_runs: tuple[HADRun, ...] | None = None
     if args.fold == "all":
         if args.partition != "test" or args.inner_block is not None:
             parser.error("--fold all only supports the held-out test partition")
-        report = evaluate_had_oof(args.run_dir, args.device, show_progress)
+        report, timeline_runs = _evaluate_had_oof_with_runs(
+            args.run_dir, args.device, show_progress
+        )
         output = output_dir / "oof.json"
+        timeline_path = output_dir / "oof_timeline.png"
     else:
         fold = int(args.fold)
         training_mode = "inner_cv" if args.inner_block else "full_half_refit"
@@ -403,16 +432,37 @@ def main() -> None:
             path, fold, model_type, seed, args.partition, args.device,
             training_mode, args.inner_block, show_progress,
         )
+        expected_head = metadata.get(
+            "had_head_type",
+            metadata.get("config", {}).get("model", {}).get(
+                "had_head_type", "direct"
+            ),
+        )
+        if evaluation.report["had_head_type"] != expected_head:
+            raise ValueError("Checkpoint output head disagrees with run metadata")
         report = evaluation.report
+        timeline_runs = evaluation.runs
         suffix = (
             f"inner_block{args.inner_block}_{args.partition}"
             if args.inner_block
             else args.partition
         )
         output = output_dir / f"fold{fold}_{suffix}.json"
+        timeline_path = output_dir / f"fold{fold}_{suffix}_timeline.png"
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
+    if args.save_timeline:
+        from .plotting import HAD_COLORS, save_prediction_timeline
+
+        save_prediction_timeline(
+            timeline_runs,
+            float(report["source_fps"]),
+            timeline_path,
+            f"WCSF H/A/D: {model_type}",
+            class_names=CLASS_NAMES,
+            class_colors=HAD_COLORS,
+        )
     frame = (
         report["combined"]["frame_metrics"]
         if args.fold == "all"
@@ -427,6 +477,8 @@ def main() -> None:
     print(f"Macro F1: {frame['macro_f1']:.4f}")
     print(f"Possession spell F1: {spells['mean_f1']:.4f}")
     print(f"Saved: {output}")
+    if args.save_timeline:
+        print(f"Saved: {timeline_path}")
 
 
 if __name__ == "__main__":

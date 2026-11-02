@@ -261,7 +261,7 @@ are zero-filled and must be interpreted through `prediction_valid_25hz`.
 
 - Threshold selection or probability calibration.
 - Tracking degradation augmentation or domain adaptation.
-- Final spell decoding or temporal smoothing.
+- Learned or hard-duration temporal decoding.
 
 ## Strict labels and direct H/A/D mode
 
@@ -309,3 +309,23 @@ H/A/D evaluation reports frame accuracy, macro F1, per-class precision/recall/F1
 confusion matrix, and the official one-to-one possession-spell F1 at IoUs 0.3 through 0.7.
 Fragmentation and transition diagnostics use explicit valid runs and 10 Hz tolerances of 5 and
 10 frames. Neither spells nor transitions cross halftime or an invalid-label gap.
+
+### H/A/D temporal postprocessing
+
+Temporal postprocessing can be tuned without retraining or using an outer test half:
+
+```powershell
+python -m modeling.alive_dead.postprocess_had --run-dir <completed-had-run-folder>
+```
+
+For each outer fold, the command selects a centered probability-smoothing window and a symmetric
+Viterbi transition penalty using only that fold's three inner-validation checkpoints. It then
+applies the selected values unchanged to the corresponding refit model's held-out half and
+compares raw argmax, smoothing, Viterbi and the validation-selected overall decoder in combined
+OOF results.
+
+Decoding restarts at halftime, partition boundaries and invalid-label gaps. The checkpoint-bound
+probability cache is stored at `postprocessing/probabilities.npz`; timestamped experiment reports
+are stored under `postprocessing/decoding_<datetime>/`. Existing checkpoints and evaluation
+reports are not modified. Use `--rebuild-cache` only when the probabilities should be inferred
+again.

@@ -7,6 +7,7 @@ import numpy as np
 
 from feature_engineering.wcsf_features import (
     TEAM_FEATURE_NAMES,
+    build_ball_features,
     build_features,
     build_player_features,
     build_team_features,
@@ -16,14 +17,21 @@ from feature_engineering.wcsf_features import (
 )
 
 
-HEADER = ["timestamp_ms", "group_id", "player_id", "x", "y", "speed"]
+HEADER = [
+    "timestamp_ms", "group_id", "player_id", "x", "y", "speed",
+    "x_ball", "y_ball",
+]
 
 
 def write_rows(path, rows):
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=HEADER)
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            row = dict(row)
+            row.setdefault("x_ball", 0.0)
+            row.setdefault("y_ball", 0.0)
+            writer.writerow(row)
 
 
 class WcsfFeatureTests(unittest.TestCase):
@@ -79,6 +87,30 @@ class WcsfFeatureTests(unittest.TestCase):
         self.assertTrue(np.all(features[1, 1] == 0.0))
         self.assertEqual(TEAM_FEATURE_NAMES.tolist()[2], "speed_std")
 
+    def test_ball_copy_alignment_speed_and_half_reset(self):
+        second_path = Path(self.temp_dir.name) / "second.csv"
+        write_rows(
+            self.path,
+            [
+                {"timestamp_ms": 0, "group_id": 1, "player_id": 1, "x": 0, "y": 0, "speed": 1, "x_ball": 0, "y_ball": 0},
+                {"timestamp_ms": 0, "group_id": 2, "player_id": 2, "x": 0, "y": 0, "speed": 1, "x_ball": 0, "y_ball": 0},
+                {"timestamp_ms": 100, "group_id": 1, "player_id": 1, "x": 0, "y": 0, "speed": 1, "x_ball": 3, "y_ball": 4},
+                {"timestamp_ms": 100, "group_id": 2, "player_id": 2, "x": 0, "y": 0, "speed": 1, "x_ball": -3, "y_ball": -4},
+            ],
+        )
+        write_rows(
+            second_path,
+            [
+                {"timestamp_ms": 1000, "group_id": 1, "player_id": 1, "x": 0, "y": 0, "speed": 1, "x_ball": 5, "y_ball": 5},
+                {"timestamp_ms": 1000, "group_id": 2, "player_id": 2, "x": 0, "y": 0, "speed": 1, "x_ball": -5, "y_ball": -5},
+            ],
+        )
+        result = build_ball_features(load_wcsf_positions([self.path, second_path]))
+        np.testing.assert_allclose(result["ball"][1, :2], [3 / 105 + 0.5, 4 / 68 + 0.5])
+        self.assertAlmostEqual(float(result["ball"][1, 2]), 50.0)
+        self.assertEqual(result["ball_speed_valid"].tolist(), [False, True, False])
+        self.assertTrue(result["ball_location_valid"].all())
+
     def test_duplicate_player_is_rejected(self):
         row = {"timestamp_ms": 0, "group_id": 1, "player_id": 10, "x": 0, "y": 0, "speed": 1}
         write_rows(self.path, [row, row])
@@ -110,7 +142,8 @@ class WcsfFeatureTests(unittest.TestCase):
         save_features(result, output)
         with np.load(output) as archive:
             self.assertEqual(archive["players"].shape, (2, 2, 24, 3))
-            self.assertEqual(archive["schema_version"].item(), "1.0")
+            self.assertEqual(archive["schema_version"].item(), "1.1")
+            self.assertEqual(archive["ball"].shape, (2, 3))
 
 
 class FullWcsfAcceptanceTests(unittest.TestCase):
@@ -123,6 +156,9 @@ class FullWcsfAcceptanceTests(unittest.TestCase):
         result = build_features(paths)
         self.assertEqual(result["players"].shape, (57374, 2, 24, 3))
         self.assertEqual(result["team_features"].shape, (57374, 2, 6))
+        self.assertEqual(result["ball"].shape, (57374, 3))
+        self.assertEqual(int(result["ball_location_valid"].sum()), 57374)
+        self.assertEqual(int(result["ball_speed_valid"].sum()), 57372)
         self.assertEqual(np.sum(result["half_id"] == 1), 28014)
         self.assertEqual(np.sum(result["half_id"] == 2), 29360)
         self.assertTrue(np.isfinite(result["players"]).all())

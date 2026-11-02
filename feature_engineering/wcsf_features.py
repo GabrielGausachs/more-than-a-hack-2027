@@ -16,6 +16,7 @@ MAX_PLAYERS_PER_TEAM = 24
 SOURCE_FPS = 10.0
 
 PLAYER_FEATURE_NAMES = np.array(["x", "y", "speed"])
+BALL_FEATURE_NAMES = np.array(["x", "y", "speed"])
 TEAM_FEATURE_NAMES = np.array(
     [
         "mean_speed",
@@ -37,6 +38,8 @@ _ROW_DTYPE = np.dtype(
         ("x", "f8"),
         ("y", "f8"),
         ("speed", "f8"),
+        ("x_ball", "f8"),
+        ("y_ball", "f8"),
     ]
 )
 
@@ -47,9 +50,12 @@ def _float_or_nan(value: str) -> float:
 
 
 def _read_half(path: Path, half_id: int) -> np.ndarray:
-    required = {"timestamp_ms", "group_id", "player_id", "x", "y", "speed"}
+    required = {
+        "timestamp_ms", "group_id", "player_id", "x", "y", "speed",
+        "x_ball", "y_ball",
+    }
 
-    def rows() -> Iterable[Tuple[int, int, int, int, float, float, float]]:
+    def rows() -> Iterable[Tuple[int, int, int, int, float, float, float, float, float]]:
         with path.open(newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
             missing = required.difference(reader.fieldnames or ())
@@ -65,6 +71,8 @@ def _read_half(path: Path, half_id: int) -> np.ndarray:
                         _float_or_nan(row["x"]),
                         _float_or_nan(row["y"]),
                         _float_or_nan(row["speed"]),
+                        _float_or_nan(row["x_ball"]),
+                        _float_or_nan(row["y_ball"]),
                     )
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"Invalid value in {path} at CSV line {line_number}") from exc
@@ -168,6 +176,79 @@ def build_player_features(rows: np.ndarray) -> Dict[str, np.ndarray]:
         "timestamp_ms": rows["timestamp_ms"][frame_rows].astype(np.int64),
         "half_id": rows["half_id"][frame_rows].astype(np.int8),
         "sample_index": np.arange(n_frames, dtype=np.int64),
+    }
+
+
+def build_ball_features(rows: np.ndarray) -> Dict[str, np.ndarray]:
+    """Build one shared ball observation and a backward displacement speed per frame."""
+    if rows.dtype != _ROW_DTYPE or not len(rows):
+        raise TypeError("rows must be the non-empty array returned by load_wcsf_positions")
+    order = np.lexsort((rows["group_id"], rows["timestamp_ms"], rows["half_id"]))
+    rows = rows[order]
+    frame_start = np.r_[
+        True,
+        (rows["half_id"][1:] != rows["half_id"][:-1])
+        | (rows["timestamp_ms"][1:] != rows["timestamp_ms"][:-1]),
+    ]
+    frame_index = np.cumsum(frame_start) - 1
+    team_index = rows["group_id"].astype(np.int64) - 1
+    if not np.isin(team_index, (0, 1)).all():
+        raise ValueError("Ball copies require group_id 1 (home) or 2 (away)")
+
+    set_start = np.r_[True, frame_start[1:] | (team_index[1:] != team_index[:-1])]
+    starts = np.flatnonzero(set_start)
+    lengths = np.diff(np.r_[starts, len(rows)])
+    n_frames = int(frame_index[-1]) + 1
+    copies = np.zeros((n_frames, 2, 2), dtype=np.float64)
+    copy_valid = np.zeros((n_frames, 2), dtype=bool)
+    seen = np.zeros((n_frames, 2), dtype=bool)
+    for start, length in zip(starts, lengths):
+        group = rows[start : start + length]
+        values = np.column_stack((group["x_ball"], group["y_ball"]))
+        first = values[0]
+        equal = (values == first) | (np.isnan(values) & np.isnan(first))
+        if not equal.all():
+            row = rows[start]
+            raise ValueError(
+                "Conflicting ball copies for "
+                f"half={row['half_id']}, timestamp_ms={row['timestamp_ms']}, "
+                f"group_id={row['group_id']}"
+            )
+        frame = int(frame_index[start])
+        team = int(team_index[start])
+        copies[frame, team] = np.where(np.isfinite(first), first, 0.0)
+        copy_valid[frame, team] = bool(np.isfinite(first).all())
+        seen[frame, team] = True
+    if not seen.all():
+        raise ValueError("Every WCSF timestamp must contain Home and Away ball copies")
+    if not np.array_equal(copy_valid[:, 0], copy_valid[:, 1]):
+        raise ValueError("Home and Away ball-copy validity disagrees")
+    valid = copy_valid[:, 0]
+    if not np.array_equal(copies[valid, 0], -copies[valid, 1]):
+        raise ValueError("Away ball copies do not align with Home after 180-degree rotation")
+
+    frame_rows = np.flatnonzero(frame_start)
+    half_id = rows["half_id"][frame_rows].astype(np.int8)
+    timestamp_ms = rows["timestamp_ms"][frame_rows].astype(np.int64)
+    ball = np.zeros((n_frames, 3), dtype=np.float32)
+    ball[valid, 0] = copies[valid, 0, 0] / PITCH_LENGTH_M + 0.5
+    ball[valid, 1] = copies[valid, 0, 1] / PITCH_WIDTH_M + 0.5
+    speed_valid = np.zeros(n_frames, dtype=bool)
+    consecutive = (
+        (half_id[1:] == half_id[:-1])
+        & valid[1:]
+        & valid[:-1]
+        & (timestamp_ms[1:] > timestamp_ms[:-1])
+    )
+    current = np.flatnonzero(consecutive) + 1
+    delta_seconds = (timestamp_ms[current] - timestamp_ms[current - 1]) / 1000.0
+    displacement = copies[current, 0] - copies[current - 1, 0]
+    ball[current, 2] = np.linalg.norm(displacement, axis=1) / delta_seconds
+    speed_valid[current] = True
+    return {
+        "ball": ball,
+        "ball_location_valid": valid,
+        "ball_speed_valid": speed_valid,
     }
 
 
@@ -287,6 +368,30 @@ def validate_features(result: Mapping[str, np.ndarray]) -> None:
     if not np.allclose(team_features, expected_features, rtol=1e-6, atol=1e-6):
         raise ValueError("team_features are inconsistent with player features and masks")
 
+    ball_keys = {"ball", "ball_location_valid", "ball_speed_valid"}
+    present = ball_keys.intersection(result)
+    if present and present != ball_keys:
+        raise ValueError(f"Ball feature result is incomplete: {sorted(ball_keys - present)}")
+    if present:
+        ball = result["ball"]
+        ball_location_valid = result["ball_location_valid"]
+        ball_speed_valid = result["ball_speed_valid"]
+        if ball.shape != (n_frames, 3) or ball.dtype != np.float32:
+            raise ValueError("ball must have shape (N, 3) and dtype float32")
+        if (
+            ball_location_valid.shape != (n_frames,)
+            or ball_speed_valid.shape != (n_frames,)
+            or ball_location_valid.dtype != np.bool_
+            or ball_speed_valid.dtype != np.bool_
+        ):
+            raise ValueError("Ball validity masks must be Boolean with shape (N,)")
+        if not np.isfinite(ball).all():
+            raise ValueError("Saved ball features must contain only finite values")
+        if np.any(ball[:, :2][~ball_location_valid] != 0.0):
+            raise ValueError("Invalid ball locations must be zero-filled")
+        if np.any(ball[:, 2][~ball_speed_valid] != 0.0):
+            raise ValueError("Invalid ball speeds must be zero-filled")
+
 
 def save_features(result: Mapping[str, np.ndarray], output_path: Path | str) -> None:
     """Validate and write a compressed, self-describing NPZ archive."""
@@ -298,7 +403,9 @@ def save_features(result: Mapping[str, np.ndarray], output_path: Path | str) -> 
 
 def build_features(paths: Sequence[Path | str]) -> Dict[str, np.ndarray]:
     """Run the complete in-memory WCSF feature pipeline."""
-    result = build_player_features(load_wcsf_positions(paths))
+    rows = load_wcsf_positions(paths)
+    result = build_player_features(rows)
+    result.update(build_ball_features(rows))
     team_features, team_valid = build_team_features(
         result["players"], result["player_location_valid"], result["player_speed_valid"]
     )
@@ -307,12 +414,16 @@ def build_features(paths: Sequence[Path | str]) -> Dict[str, np.ndarray]:
             "team_features": team_features,
             "team_feature_valid": team_valid,
             "player_feature_names": PLAYER_FEATURE_NAMES,
+            "ball_feature_names": BALL_FEATURE_NAMES,
             "team_feature_names": TEAM_FEATURE_NAMES,
             "team_order": TEAM_ORDER,
             "source_fps": np.array(SOURCE_FPS, dtype=np.float32),
             "pitch_length_m": np.array(PITCH_LENGTH_M, dtype=np.float32),
             "pitch_width_m": np.array(PITCH_WIDTH_M, dtype=np.float32),
-            "schema_version": np.array("1.0"),
+            "schema_version": np.array("1.1"),
+            "ball_speed_provenance": np.array(
+                "backward displacement between consecutive valid 10 Hz positions within each half"
+            ),
             "orientation": np.array(
                 "home attacks +x; away attacks -x; away source coordinates rotated 180 degrees"
             ),
@@ -328,7 +439,7 @@ def _default_paths() -> Tuple[Path, Path, Path]:
     return (
         data_dir / "positions_FIRST_HALF.csv",
         data_dir / "positions_SECOND_HALF.csv",
-        data_dir / "processed" / "wcsf_player_team_features.npz",
+        data_dir / "processed" / "wcsf_player_team_ball_features.npz",
     )
 
 
@@ -348,7 +459,11 @@ def main() -> None:
     }
     print(f"Saved {len(result['timestamp_ms']):,} timestamps to {args.output}")
     print(f"Half counts: {half_counts}")
-    print(f"players: {result['players'].shape}; team_features: {result['team_features'].shape}")
+    print(
+        f"players: {result['players'].shape}; team_features: {result['team_features'].shape}; "
+        f"ball location/speed valid: {result['ball_location_valid'].mean():.2%}/"
+        f"{result['ball_speed_valid'].mean():.2%}"
+    )
 
 
 if __name__ == "__main__":

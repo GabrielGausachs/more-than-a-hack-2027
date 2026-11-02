@@ -12,6 +12,7 @@ import numpy as np
 
 from games import asset_paths, half_video_blocks, source_frames
 from feature_engineering.wcsf_features import (
+    BALL_FEATURE_NAMES,
     MAX_PLAYERS_PER_TEAM,
     PLAYER_FEATURE_NAMES,
     TEAM_FEATURE_NAMES,
@@ -180,6 +181,9 @@ def load_selected_player_features(
     players = np.zeros((n_samples, 2, MAX_PLAYERS_PER_TEAM, 3), dtype=np.float32)
     location_valid = np.zeros((n_samples, 2, MAX_PLAYERS_PER_TEAM), dtype=bool)
     speed_valid = np.zeros_like(location_valid)
+    ball = np.zeros((n_samples, 3), dtype=np.float32)
+    ball_location_valid = np.zeros(n_samples, dtype=bool)
+    ball_speed_valid = np.zeros(n_samples, dtype=bool)
     slot_team = np.asarray(metadata["slot_team_index"])
     slot_within_team = np.asarray(metadata["slot_within_team"])
     seen = np.zeros(n_samples, dtype=bool)
@@ -220,6 +224,18 @@ def load_selected_player_features(
                 if np.isfinite(speed):
                     players[sample, team, slot, 2] = speed
                     speed_valid[sample, team, slot] = True
+            ball_values = parts[2].split(",")
+            if len(ball_values) != 3:
+                raise ValueError(f"Malformed ball observation at ATD frame {frame_id}")
+            ball_x, ball_y, ball_speed = (float(value) for value in ball_values)
+            if np.isfinite(ball_x) and np.isfinite(ball_y):
+                if rotate:
+                    ball_x, ball_y = 1.0 - ball_x, 1.0 - ball_y
+                ball[sample, :2] = (ball_x, ball_y)
+                ball_location_valid[sample] = True
+            if np.isfinite(ball_speed):
+                ball[sample, 2] = ball_speed
+                ball_speed_valid[sample] = True
             seen[sample] = True
 
     if line_count != n_source_frames:
@@ -233,6 +249,9 @@ def load_selected_player_features(
         "players": players,
         "player_location_valid": location_valid,
         "player_speed_valid": speed_valid,
+        "ball": ball,
+        "ball_location_valid": ball_location_valid,
+        "ball_speed_valid": ball_speed_valid,
     }
 
 
@@ -262,6 +281,7 @@ def build_metrica_features(
             "team_feature_valid": team_valid,
             "sample_index": np.arange(len(alignment["half_id"]), dtype=np.int64),
             "player_feature_names": PLAYER_FEATURE_NAMES.copy(),
+            "ball_feature_names": BALL_FEATURE_NAMES.copy(),
             "team_feature_names": TEAM_FEATURE_NAMES.copy(),
             "team_order": TEAM_ORDER.copy(),
             "team_names": np.asarray(metadata["team_names"]),
@@ -272,7 +292,10 @@ def build_metrica_features(
             "original_frame_count": np.array(n_frames, dtype=np.int64),
             "pitch_length_m": np.array(metadata["pitch_length_m"], dtype=np.float32),
             "pitch_width_m": np.array(metadata["pitch_width_m"], dtype=np.float32),
-            "schema_version": np.array("1.0"),
+            "schema_version": np.array("1.1"),
+            "ball_speed_provenance": np.array(
+                "provider-reported speed from the selected nearest 25 Hz ATD frame"
+            ),
             "orientation": np.array(
                 "home attacks +x; away attacks -x; both teams rotated 180 degrees in half 2"
             ),
@@ -391,12 +414,12 @@ def _default_paths() -> tuple[Path, Path, Path, Path]:
     return (
         Path(paths["atd_meta"]),
         Path(paths["atd_raw"]),
-        data_root / "processed" / "metrica_player_team_features.npz",
+        data_root / "processed" / "metrica_player_team_ball_features.npz",
         root
         / "data"
         / "open_data_groningen"
         / "processed"
-        / "wcsf_player_team_features.npz",
+        / "wcsf_player_team_ball_features.npz",
     )
 
 
@@ -431,6 +454,11 @@ def main() -> None:
         "Valid locations: "
         f"{100.0 * result['player_location_valid'].mean():.2f}%; "
         f"valid speeds: {100.0 * result['player_speed_valid'].mean():.2f}%"
+    )
+    print(
+        "Valid ball locations/speeds: "
+        f"{100.0 * result['ball_location_valid'].mean():.2f}%/"
+        f"{100.0 * result['ball_speed_valid'].mean():.2f}%"
     )
     print(json.dumps(comparison, indent=2))
 

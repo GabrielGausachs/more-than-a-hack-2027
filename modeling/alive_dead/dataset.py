@@ -27,6 +27,9 @@ class WCSFData:
     half_id: np.ndarray
     sample_index: np.ndarray
     source_fps: float
+    ball: np.ndarray | None = None
+    ball_location_valid: np.ndarray | None = None
+    ball_speed_valid: np.ndarray | None = None
     label_valid: np.ndarray | None = None
 
     def __post_init__(self) -> None:
@@ -34,6 +37,19 @@ class WCSFData:
             object.__setattr__(self, "label_valid", np.ones(len(self.labels), dtype=bool))
         elif self.label_valid.shape != (len(self.labels),) or self.label_valid.dtype != np.bool_:
             raise ValueError("label_valid must be Boolean with one value per frame")
+        ball_arrays = (self.ball, self.ball_location_valid, self.ball_speed_valid)
+        if any(value is not None for value in ball_arrays) and not all(
+            value is not None for value in ball_arrays
+        ):
+            raise ValueError("Ball values and both validity masks must be provided together")
+        if self.ball is not None:
+            if self.ball.shape != (len(self.labels), 3):
+                raise ValueError("ball must have shape (N, 3)")
+            if (
+                self.ball_location_valid.shape != (len(self.labels),)
+                or self.ball_speed_valid.shape != (len(self.labels),)
+            ):
+                raise ValueError("Ball validity masks must have shape (N,)")
 
     @property
     def n_frames(self) -> int:
@@ -44,6 +60,7 @@ def load_wcsf_data(
     feature_path: str | Path,
     label_path: str | Path,
     classification_mode: str = "binary",
+    use_ball: bool = False,
 ) -> WCSFData:
     """Load approved model arrays and verify exact feature/label alignment."""
     feature_keys = {
@@ -62,6 +79,14 @@ def load_wcsf_data(
         if missing:
             raise ValueError(f"Feature archive is missing arrays: {sorted(missing)}")
         features = {key: archive[key].copy() for key in feature_keys}
+        ball_keys = {"ball", "ball_location_valid", "ball_speed_valid"}
+        present = ball_keys.intersection(archive.files)
+        if present and present != ball_keys:
+            raise ValueError(f"Feature archive has incomplete ball arrays: {sorted(present)}")
+        if use_ball and present != ball_keys:
+            raise ValueError("use_ball=True requires a ball-enabled feature archive")
+        if use_ball:
+            features.update({key: archive[key].copy() for key in ball_keys})
 
     with np.load(label_path, allow_pickle=False) as archive:
         required = {"labels", "timestamp_ms", "half_id", "sample_index"}
@@ -116,6 +141,18 @@ def load_wcsf_data(
         raise ValueError("Model inputs contain non-finite values")
     if not np.array_equal(features["sample_index"], np.arange(n_frames)):
         raise ValueError("sample_index must be contiguous and zero-based")
+    if use_ball:
+        if features["ball"].shape != (n_frames, 3) or features["ball"].dtype != np.float32:
+            raise ValueError("ball must have shape (N, 3) and dtype float32")
+        for key in ("ball_location_valid", "ball_speed_valid"):
+            if features[key].shape != (n_frames,) or features[key].dtype != np.bool_:
+                raise ValueError(f"{key} must be Boolean with shape (N,)")
+        if not np.isfinite(features["ball"]).all():
+            raise ValueError("Ball inputs contain non-finite values")
+        if np.any(features["ball"][:, :2][~features["ball_location_valid"]] != 0.0):
+            raise ValueError("Invalid ball locations must be zero-filled")
+        if np.any(features["ball"][:, 2][~features["ball_speed_valid"]] != 0.0):
+            raise ValueError("Invalid ball speeds must be zero-filled")
 
     source_fps = float(features["source_fps"])
     for half in np.unique(features["half_id"]):
@@ -135,6 +172,9 @@ def load_wcsf_data(
         half_id=features["half_id"],
         sample_index=features["sample_index"],
         source_fps=source_fps,
+        ball=features.get("ball"),
+        ball_location_valid=features.get("ball_location_valid"),
+        ball_speed_valid=features.get("ball_speed_valid"),
         label_valid=label_valid,
     )
 
@@ -233,7 +273,7 @@ class TemporalWindowDataset(Dataset):
         loss_weight[window.supervision_start : window.supervision_end] = (
             1.0 / self.coverage[supervised_global]
         )
-        return {
+        batch = {
             "players": torch.from_numpy(self._padded(self.data.players, window)),
             "player_location_valid": torch.from_numpy(
                 self._padded(self.data.player_location_valid, window)
@@ -255,6 +295,19 @@ class TemporalWindowDataset(Dataset):
             "supervision_mask": torch.from_numpy(supervision_mask),
             "loss_weight": torch.from_numpy(loss_weight),
         }
+        if self.data.ball is not None:
+            batch.update(
+                {
+                    "ball": torch.from_numpy(self._padded(self.data.ball, window)),
+                    "ball_location_valid": torch.from_numpy(
+                        self._padded(self.data.ball_location_valid, window)
+                    ),
+                    "ball_speed_valid": torch.from_numpy(
+                        self._padded(self.data.ball_speed_valid, window)
+                    ),
+                }
+            )
+        return batch
 
 
 def normalize_wcsf_data(data: WCSFData, normalizer: FeatureNormalizer) -> WCSFData:
@@ -266,6 +319,11 @@ def normalize_wcsf_data(data: WCSFData, normalizer: FeatureNormalizer) -> WCSFDa
         data.team_features,
         data.team_feature_valid,
     )
+    ball = None
+    if data.ball is not None:
+        ball = normalizer.transform_ball(
+            data.ball, data.ball_location_valid, data.ball_speed_valid
+        )
     return WCSFData(
         players=players,
         player_location_valid=data.player_location_valid,
@@ -277,6 +335,9 @@ def normalize_wcsf_data(data: WCSFData, normalizer: FeatureNormalizer) -> WCSFDa
         half_id=data.half_id,
         sample_index=data.sample_index,
         source_fps=data.source_fps,
+        ball=ball,
+        ball_location_valid=data.ball_location_valid,
+        ball_speed_valid=data.ball_speed_valid,
         label_valid=data.label_valid,
     )
 
@@ -297,6 +358,7 @@ def build_dataloaders(
         config.data.feature_path,
         config.data.label_path,
         config.model.classification_mode,
+        config.model.use_ball,
     )
     config.validate(raw.source_fps)
     if full_half_refit:
@@ -316,6 +378,8 @@ def build_dataloaders(
         raw.team_features,
         raw.team_feature_valid,
         split.train_mask,
+        ball=raw.ball,
+        ball_speed_valid=raw.ball_speed_valid,
     )
     data = normalize_wcsf_data(raw, normalizer)
     sequence_frames = config.seconds_to_frames(config.data.sequence_seconds, raw.source_fps)

@@ -77,8 +77,8 @@ class PlayerFeatureTests(unittest.TestCase):
         second[1] = atd_group("NaN", "0.4", "3")
         second[24] = atd_group("1.2", "-0.1", "NaN")
         self.raw_path.write_text(
-            f"1:{';'.join(first)}:NaN,NaN,NaN\n"
-            f"2:{';'.join(second)}:NaN,NaN,NaN\n",
+            f"1:{';'.join(first)}:1.2,-0.1,7\n"
+            f"2:{';'.join(second)}:0.2,0.3,NaN\n",
             encoding="utf-8",
         )
         alignment = {
@@ -100,6 +100,10 @@ class PlayerFeatureTests(unittest.TestCase):
         self.assertEqual(result["players"][1, 0, 1, 2], 3.0)
         self.assertFalse(result["player_location_valid"][:, 1, 22:].any())
         self.assertTrue(np.all(result["players"][:, 1, 22:] == 0.0))
+        np.testing.assert_allclose(result["ball"][0], [1.2, -0.1, 7.0])
+        np.testing.assert_allclose(result["ball"][1, :2], [0.8, 0.7])
+        self.assertTrue(result["ball_location_valid"].all())
+        self.assertEqual(result["ball_speed_valid"].tolist(), [True, False])
 
         team_features, team_valid = build_team_features(
             result["players"],
@@ -114,7 +118,7 @@ class PlayerFeatureTests(unittest.TestCase):
 class FullArchiveTests(unittest.TestCase):
     def test_generated_archive_contract(self):
         root = Path(__file__).resolve().parents[1]
-        path = root / "data/metrica/processed/metrica_player_team_features.npz"
+        path = root / "data/metrica/processed/metrica_player_team_ball_features.npz"
         if not path.exists():
             self.skipTest("Generated Metrica feature archive is unavailable")
         with np.load(path, allow_pickle=False) as archive:
@@ -122,6 +126,7 @@ class FullArchiveTests(unittest.TestCase):
         validate_metrica_features(result)
         self.assertEqual(result["players"].shape, (63543, 2, 24, 3))
         self.assertEqual(result["team_features"].shape, (63543, 2, 6))
+        self.assertEqual(result["ball"].shape, (63543, 3))
         self.assertEqual(np.count_nonzero(result["half_id"] == 1), 31787)
         self.assertEqual(np.count_nonzero(result["half_id"] == 2), 31756)
         self.assertEqual(result["players"].dtype, np.float32)
@@ -132,12 +137,13 @@ class FullArchiveTests(unittest.TestCase):
 
         wcsf_path = (
             root
-            / "data/open_data_groningen/processed/wcsf_player_team_features.npz"
+            / "data/open_data_groningen/processed/wcsf_player_team_ball_features.npz"
         )
         if wcsf_path.exists():
             with np.load(wcsf_path, allow_pickle=False) as wcsf:
                 for name in (
                     "player_feature_names",
+                    "ball_feature_names",
                     "team_feature_names",
                     "team_order",
                     "source_fps",

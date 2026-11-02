@@ -188,6 +188,9 @@ def validate_full_segments(
             segment,
             device,
             chunk_frames,
+            ball=data.ball,
+            ball_location_valid=data.ball_location_valid,
+            ball_speed_valid=data.ball_speed_valid,
         )
         frame_slice = slice(segment.start, segment.end)
         valid = torch.from_numpy(data.label_valid[frame_slice]).bool()

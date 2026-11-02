@@ -236,6 +236,12 @@ def normalizer_from_state(state: Mapping[str, object]) -> FeatureNormalizer:
         team_speed_mean=np.asarray(state["team_speed_mean"], dtype=np.float64),
         team_speed_std=np.asarray(state["team_speed_std"], dtype=np.float64),
         epsilon=float(state["epsilon"]),
+        ball_speed_mean=(
+            float(state["ball_speed_mean"]) if "ball_speed_mean" in state else None
+        ),
+        ball_speed_std=(
+            float(state["ball_speed_std"]) if "ball_speed_std" in state else None
+        ),
     )
     if (
         normalizer.team_speed_mean.shape != (3,)
@@ -246,6 +252,15 @@ def normalizer_from_state(state: Mapping[str, object]) -> FeatureNormalizer:
         or not np.isfinite(normalizer.team_speed_std).all()
         or normalizer.player_speed_std < normalizer.epsilon
         or np.any(normalizer.team_speed_std < normalizer.epsilon)
+        or ((normalizer.ball_speed_mean is None) != (normalizer.ball_speed_std is None))
+        or (
+            normalizer.ball_speed_std is not None
+            and (
+                not np.isfinite(normalizer.ball_speed_mean)
+                or not np.isfinite(normalizer.ball_speed_std)
+                or normalizer.ball_speed_std < normalizer.epsilon
+            )
+        )
     ):
         raise ValueError("Checkpoint normalization parameters are invalid")
     return normalizer
@@ -287,7 +302,9 @@ def validate_checkpoint(
     config.validate(
         float(checkpoint.get("source_fps", 10.0)), require_supervised_coverage=False
     )
-    normalizer_from_state(checkpoint["normalizer"])
+    normalizer = normalizer_from_state(checkpoint["normalizer"])
+    if config.model.use_ball and normalizer.ball_speed_mean is None:
+        raise ValueError("Ball-enabled checkpoint is missing ball normalization parameters")
     return config
 
 
@@ -304,6 +321,9 @@ def _predict_valid_runs(
         data.team_feature_valid,
         segment,
         device,
+        ball=data.ball,
+        ball_location_valid=data.ball_location_valid,
+        ball_speed_valid=data.ball_speed_valid,
     )
     predictions = (probabilities >= THRESHOLD).astype(np.int8)
     return tuple(
@@ -329,6 +349,9 @@ def _predict_probabilities(
     team_feature_valid: np.ndarray,
     segment: Segment,
     device: torch.device,
+    ball: np.ndarray | None = None,
+    ball_location_valid: np.ndarray | None = None,
+    ball_speed_valid: np.ndarray | None = None,
 ) -> np.ndarray:
     """Infer one genuinely contiguous segment and return ALIVE probabilities."""
     logits = predict_segment_logits(
@@ -340,6 +363,9 @@ def _predict_probabilities(
         team_feature_valid,
         segment,
         device,
+        ball=ball,
+        ball_location_valid=ball_location_valid,
+        ball_speed_valid=ball_speed_valid,
     )
     if logits.shape != (segment.length,) or not torch.isfinite(logits).all():
         raise ValueError("Model produced invalid segment logits")
@@ -402,7 +428,7 @@ def evaluate_checkpoint(
     if config.model.classification_mode != "binary":
         raise ValueError("The binary evaluator requires classification_mode='binary'")
     raw = load_wcsf_data(
-        config.data.feature_path, config.data.label_path, "binary"
+        config.data.feature_path, config.data.label_path, "binary", config.model.use_ball
     )
     if float(checkpoint.get("source_fps", raw.source_fps)) != raw.source_fps:
         raise ValueError("Checkpoint and feature archive source frequencies disagree")
@@ -738,6 +764,21 @@ def _infer_metrica_checkpoint(
         features["team_features"],
         features["team_feature_valid"],
     )
+    ball = None
+    ball_location_valid = None
+    ball_speed_valid = None
+    if config.model.use_ball:
+        required = {"ball", "ball_location_valid", "ball_speed_valid"}
+        missing = required.difference(features)
+        if missing:
+            raise ValueError(f"Metrica archive is missing ball arrays: {sorted(missing)}")
+        ball = normalizer.transform_ball(
+            features["ball"],
+            features["ball_location_valid"],
+            features["ball_speed_valid"],
+        )
+        ball_location_valid = features["ball_location_valid"]
+        ball_speed_valid = features["ball_speed_valid"]
     if not np.isfinite(players).all() or not np.isfinite(team_features).all():
         raise ValueError("Normalization produced non-finite Metrica inputs")
 
@@ -756,6 +797,9 @@ def _infer_metrica_checkpoint(
             features["team_feature_valid"],
             segment,
             device,
+            ball,
+            ball_location_valid,
+            ball_speed_valid,
         )
         coverage[segment.start : segment.end] += 1
     if not np.all(coverage == 1) or not np.isfinite(probabilities).all():
@@ -1047,7 +1091,7 @@ def main() -> None:
     parser.add_argument(
         "--metrica-features",
         type=Path,
-        default=Path("data/metrica/processed/metrica_player_team_features.npz"),
+        default=Path("data/metrica/processed/metrica_player_team_ball_features.npz"),
     )
     parser.add_argument(
         "--metrica-ground-truth",

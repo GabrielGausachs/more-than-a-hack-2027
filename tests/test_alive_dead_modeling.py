@@ -34,7 +34,7 @@ from modeling.alive_dead.train import run_cross_validation
 from modeling.alive_dead.runs import create_run_directory, load_run_metadata, run_name
 
 
-def synthetic_data(n_frames=24):
+def synthetic_data(n_frames=24, include_ball=False):
     players = np.zeros((n_frames, 2, 24, 3), dtype=np.float32)
     location_valid = np.zeros((n_frames, 2, 24), dtype=bool)
     speed_valid = np.zeros_like(location_valid)
@@ -50,6 +50,10 @@ def synthetic_data(n_frames=24):
     team_features[..., 1] = 1.5 + 0.08 * time
     team_features[..., 2] = 0.5 + 0.03 * time
     team_features[..., 3:] = [2.0, 2.0, 1.0]
+    ball = np.zeros((n_frames, 3), dtype=np.float32) if include_ball else None
+    if ball is not None:
+        ball[:, :2] = 0.5
+        ball[:, 2] = np.linspace(1.0, 4.0, n_frames)
     return WCSFData(
         players=players,
         player_location_valid=location_valid,
@@ -61,6 +65,9 @@ def synthetic_data(n_frames=24):
         half_id=np.where(np.arange(n_frames) < n_frames // 2, 1, 2).astype(np.int8),
         sample_index=np.arange(n_frames, dtype=np.int64),
         source_fps=10.0,
+        ball=ball,
+        ball_location_valid=(np.ones(n_frames, dtype=bool) if include_ball else None),
+        ball_speed_valid=(np.ones(n_frames, dtype=bool) if include_ball else None),
     )
 
 
@@ -179,6 +186,26 @@ class DatasetAndNormalizationTests(unittest.TestCase):
         np.testing.assert_array_equal(teams[..., 3:], data.team_features[..., 3:])
         self.assertTrue(np.all(players[..., 2][~data.player_speed_valid] == 0.0))
 
+    def test_ball_normalizer_uses_training_frames_and_preserves_masks(self):
+        data = synthetic_data(24, include_ball=True)
+        train_mask = np.arange(24) < 12
+        normalizer = FeatureNormalizer.fit(
+            data.players,
+            data.player_speed_valid,
+            data.team_features,
+            data.team_feature_valid,
+            train_mask,
+            ball=data.ball,
+            ball_speed_valid=data.ball_speed_valid,
+        )
+        expected = data.ball[:12, 2]
+        self.assertAlmostEqual(normalizer.ball_speed_mean, float(expected.mean()), places=6)
+        transformed = normalizer.transform_ball(
+            data.ball, data.ball_location_valid, data.ball_speed_valid
+        )
+        self.assertTrue(np.isfinite(transformed).all())
+        np.testing.assert_array_equal(transformed[:, :2], data.ball[:, :2])
+
 
 class ModelTests(unittest.TestCase):
     def _batch(self, batch_size=2, length=20):
@@ -192,6 +219,9 @@ class ModelTests(unittest.TestCase):
             "labels": torch.randint(0, 2, (batch_size, length), dtype=torch.float32),
             "label_valid": torch.ones(batch_size, length, dtype=torch.bool),
             "loss_weight": torch.ones(batch_size, length),
+            "ball": torch.randn(batch_size, length, 3),
+            "ball_location_valid": torch.ones(batch_size, length, dtype=torch.bool),
+            "ball_speed_valid": torch.ones(batch_size, length, dtype=torch.bool),
         }
 
     def test_deep_sets_is_permutation_invariant(self):
@@ -248,6 +278,22 @@ class ModelTests(unittest.TestCase):
                 batch["label_valid"],
             )
             self.assertTrue(torch.isfinite(numerator / denominator))
+
+    def test_ball_enabled_binary_and_had_models(self):
+        batch = self._batch()
+        for mode in ("binary", "had"):
+            for model_type in ("team_tcn", "deepsets_tcn"):
+                model = build_model(
+                    ModelConfig(
+                        model_type=model_type,
+                        classification_mode=mode,
+                        use_ball=True,
+                    )
+                ).eval()
+                logits = model(batch)
+                expected = batch["labels"].shape if mode == "binary" else (*batch["labels"].shape, 3)
+                self.assertEqual(logits.shape, expected)
+                self.assertTrue(torch.isfinite(logits).all())
 
     def test_invalid_targets_contribute_no_loss_or_gradient(self):
         logits = torch.tensor(
@@ -334,6 +380,32 @@ class FullSegmentValidationTests(unittest.TestCase):
         )
         whole = predict_segment_logits(*arguments)
         chunked = predict_segment_logits(*arguments, chunk_frames=9)
+        torch.testing.assert_close(whole, chunked, rtol=1e-5, atol=1e-6)
+
+    def test_ball_chunked_and_whole_segment_logits_match(self):
+        data = synthetic_data(40, include_ball=True)
+        segment = Segment(3, 37, "validation", 1)
+        model = build_model(
+            ModelConfig(
+                model_type="deepsets_tcn",
+                use_ball=True,
+                dilations=(1, 2),
+                convolutions_per_block=1,
+                dropout=0.0,
+            )
+        ).eval()
+        arguments = (
+            model, data.players, data.player_location_valid,
+            data.player_speed_valid, data.team_features,
+            data.team_feature_valid, segment, torch.device("cpu"),
+        )
+        kwargs = {
+            "ball": data.ball,
+            "ball_location_valid": data.ball_location_valid,
+            "ball_speed_valid": data.ball_speed_valid,
+        }
+        whole = predict_segment_logits(*arguments, **kwargs)
+        chunked = predict_segment_logits(*arguments, chunk_frames=9, **kwargs)
         torch.testing.assert_close(whole, chunked, rtol=1e-5, atol=1e-6)
 
     def test_binary_validation_loss_counts_each_valid_frame_once(self):

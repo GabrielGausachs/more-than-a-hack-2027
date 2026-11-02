@@ -27,6 +27,21 @@ data/open_data_groningen/processed/wcsf_player_team_features.npz
 data/open_data_groningen/processed/wcsf_alive_dead_labels.npz
 ```
 
+Ball-enabled experiments instead use
+`data/open_data_groningen/processed/wcsf_player_team_ball_features.npz` and set
+`model.use_ball=true`. The historical player/team archive remains unchanged.
+
+```json
+{
+  "data": {
+    "feature_path": "data/open_data_groningen/processed/wcsf_player_team_ball_features.npz"
+  },
+  "model": {
+    "use_ball": true
+  }
+}
+```
+
 Only `labels` is read from the label archive. Vote counts and vote fractions are never exposed to
 the model. Player IDs, `PossessionFlag` and `team_game_phase` are not model inputs.
 
@@ -38,6 +53,9 @@ player_location_valid    (B,T,2,24)
 player_speed_valid       (B,T,2,24)
 team_features            (B,T,2,6)
 team_feature_valid       (B,T,2,6)
+ball                     (B,T,3)       # optional: x, y, speed
+ball_location_valid      (B,T)         # optional
+ball_speed_valid         (B,T)         # optional
 labels                   (B,T)
 output_mask              (B,T)
 supervision_mask         (B,T)
@@ -82,6 +100,8 @@ The final refit normalizer uses the complete training half:
 - Valid player speeds share one training-fold mean and standard deviation across both teams.
 - Team mean speed, median speed and speed standard deviation are standardized per feature, with
   statistics shared across Home and Away.
+- For ball-enabled runs, valid ball speeds use one additional training-fold mean and standard
+  deviation; normalized ball X/Y and both ball masks remain unchanged.
 - Tracked-player count, valid-speed count and speed coverage remain in their original scales.
 - Invalid and padded values remain zero and masks are unchanged.
 
@@ -99,6 +119,10 @@ and Away embeddings, making the branch invariant to player-slot permutations. Th
 fused with the same team inputs before the shared TCN type.
 
 Both produce one logit per frame with shape `(B,T)`.
+
+With `use_ball=true`, both frontends also concatenate
+`[ball_x, ball_y, normalized_ball_speed, location_valid, speed_valid]` before the temporal
+projection. No ball distances, interpolation or separate ball encoder are used.
 
 The default TCN has four residual blocks, dilations `[1,2,4,8]`, two noncausal kernel-3
 convolutions per block and 64 channels. Its receptive field is:
@@ -219,6 +243,10 @@ halves are inferred independently, and Fold 1/Fold 2 ALIVE probabilities are ave
 equal weights. The saved source-to-sample index reconstructs a prediction for every scored 25 Hz
 frame without interpolation. Public `H` and `A` labels are collapsed to ALIVE, `D` to DEAD, and
 `X` is excluded from scoring.
+
+Ball-enabled transfer uses `metrica_player_team_ball_features.npz`. WCSF ball speed is derived
+from backward 10 Hz displacement, whereas Metrica ball speed is the sparse provider value from
+the selected 25 Hz frame. Missing Metrica locations and speeds remain independently masked.
 
 The report contains the binary frame and segment metrics used for WCSF, plus the competition
 scorer's exact `alive_dead_f1`, transition metrics at 12 and 25 frames, and binary-adapted

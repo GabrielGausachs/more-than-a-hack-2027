@@ -78,6 +78,9 @@ def _predict_valid_runs(
         data.team_feature_valid,
         segment,
         device,
+        ball=data.ball,
+        ball_location_valid=data.ball_location_valid,
+        ball_speed_valid=data.ball_speed_valid,
     )
     if logits.shape != (segment.length, 3) or not torch.isfinite(logits).all():
         raise ValueError("H/A/D model produced invalid segment logits")
@@ -242,7 +245,12 @@ def evaluate_had_checkpoint(
         raise ValueError("The H/A/D evaluator requires classification_mode='had'")
     if training_mode == "full_half_refit" and partition == "validation":
         raise ValueError("A full-half refit has no validation partition")
-    raw = load_wcsf_data(config.data.feature_path, config.data.label_path, "had")
+    raw = load_wcsf_data(
+        config.data.feature_path,
+        config.data.label_path,
+        "had",
+        config.model.use_ball,
+    )
     if training_mode == "full_half_refit":
         split = build_refit_split(raw.half_id, expected_fold)
     else:

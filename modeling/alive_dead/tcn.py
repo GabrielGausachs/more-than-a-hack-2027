@@ -131,6 +131,13 @@ def _team_representation(batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
     return torch.cat((features.flatten(-2), valid.flatten(-2)), dim=-1)
 
 
+def _ball_representation(batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    ball = batch["ball"]
+    location_valid = batch["ball_location_valid"].to(ball.dtype).unsqueeze(-1)
+    speed_valid = batch["ball_speed_valid"].to(ball.dtype).unsqueeze(-1)
+    return torch.cat((ball, location_valid, speed_valid), dim=-1)
+
+
 class BaseAliveDeadTCN(nn.Module):
     def __init__(self, input_dim: int, config: ModelConfig) -> None:
         super().__init__()
@@ -163,17 +170,25 @@ class TeamStatisticsTCN(BaseAliveDeadTCN):
     """Team statistics and validity masks followed by the shared TCN."""
 
     def __init__(self, config: ModelConfig) -> None:
-        super().__init__(input_dim=24, config=config)
+        super().__init__(input_dim=24 + (5 if config.use_ball else 0), config=config)
+        self.use_ball = config.use_ball
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        return self.temporal_forward(_team_representation(batch), batch["output_mask"])
+        representation = _team_representation(batch)
+        if self.use_ball:
+            representation = torch.cat((representation, _ball_representation(batch)), dim=-1)
+        return self.temporal_forward(representation, batch["output_mask"])
 
 
 class DeepSetsTCN(BaseAliveDeadTCN):
     """Deep Sets player embeddings fused with team statistics before the TCN."""
 
     def __init__(self, config: ModelConfig) -> None:
-        super().__init__(input_dim=2 * config.player_embedding_dim + 24, config=config)
+        super().__init__(
+            input_dim=2 * config.player_embedding_dim + 24 + (5 if config.use_ball else 0),
+            config=config,
+        )
+        self.use_ball = config.use_ball
         self.player_encoder = DeepSetPlayerEncoder(
             config.player_hidden_dim, config.player_embedding_dim
         )
@@ -184,9 +199,10 @@ class DeepSetsTCN(BaseAliveDeadTCN):
             batch["player_location_valid"],
             batch["player_speed_valid"],
         )
-        representation = torch.cat(
-            (player_embeddings.flatten(-2), _team_representation(batch)), dim=-1
-        )
+        parts = [player_embeddings.flatten(-2), _team_representation(batch)]
+        if self.use_ball:
+            parts.append(_ball_representation(batch))
+        representation = torch.cat(parts, dim=-1)
         return self.temporal_forward(representation, batch["output_mask"])
 
 

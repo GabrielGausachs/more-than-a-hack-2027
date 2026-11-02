@@ -58,6 +58,12 @@ def build_run_metadata(
         "class_order": ["H", "A", "D"]
         if config.model.classification_mode == "had"
         else ["DEAD", "ALIVE"],
+        "input_features": {
+            "players": True,
+            "team_statistics": True,
+            "ball": config.model.use_ball,
+            "feature_archive": config.data.feature_path,
+        },
         "temporal": {
             "source_fps": fps,
             "sequence_seconds": config.data.sequence_seconds,

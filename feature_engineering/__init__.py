@@ -1,6 +1,7 @@
 """Feature-engineering utilities for the Metrica challenge project."""
 
 from .wcsf_features import (
+    build_ball_features,
     build_features,
     build_player_features,
     build_team_features,
@@ -10,6 +11,7 @@ from .wcsf_features import (
 )
 
 __all__ = [
+    "build_ball_features",
     "build_features",
     "build_player_features",
     "build_team_features",

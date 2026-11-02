@@ -20,9 +20,10 @@ The main motivation is to learn temporal tracking patterns from the externally l
 match and later transfer them to Metrica tracking. WCSF contains only one match, so its held-out
 half results measure within-match temporal generalization, not independent-match generalization.
 
-The pipeline deliberately excludes ball features, `team_game_phase`, acceleration, player-ID
-embeddings and competition Smart Tags. In particular, `team_game_phase` is strongly label-derived
-in WCSF and would create target leakage.
+The baseline excludes ball features, while an optional ball-enabled path adds only ball X/Y,
+speed and independent validity masks. Both paths exclude `team_game_phase`, acceleration,
+player-ID embeddings and competition Smart Tags. In particular, `team_game_phase` is strongly
+label-derived in WCSF and would create target leakage.
 
 ## 2. End-to-end data flow
 
@@ -31,6 +32,7 @@ WCSF half CSV files
     |
     +--> player/team feature builder
     |       `wcsf_player_team_features.npz`
+    |       optional: `wcsf_player_team_ball_features.npz`
     |
     +--> strict binary label builder
     |       `wcsf_alive_dead_labels_strict.npz`
@@ -200,6 +202,10 @@ Output:
 data/open_data_groningen/processed/wcsf_player_team_features.npz
 ```
 
+The parallel ball-enabled archive is
+`data/open_data_groningen/processed/wcsf_player_team_ball_features.npz`; the historical archive is
+not overwritten.
+
 Core arrays:
 
 | Array | Shape | Dtype |
@@ -209,6 +215,9 @@ Core arrays:
 | `player_speed_valid` | `(57374,2,24)` | `bool` |
 | `team_features` | `(57374,2,6)` | `float32` |
 | `team_feature_valid` | `(57374,2,6)` | `bool` |
+| `ball` (optional) | `(57374,3)` | `float32` |
+| `ball_location_valid` (optional) | `(57374,)` | `bool` |
+| `ball_speed_valid` (optional) | `(57374,)` | `bool` |
 | `timestamp_ms` | `(57374,)` | `int64` |
 | `half_id` | `(57374,)` | `int8` |
 | `sample_index` | `(57374,)` | `int64` |
@@ -389,6 +398,8 @@ The transformations are:
 - Tracked-player count, valid-speed count and speed coverage: retained in their original scales.
 - Validity masks: unchanged.
 - Invalid numeric positions: reset to zero after transformation.
+- Ball-enabled runs standardize valid ball speed with training-only statistics while leaving
+  normalized ball X/Y unchanged.
 
 Each inner block therefore has its own normalizer. The final refit normalizer is fitted again from
 scratch on the complete outer training half. Normalizer parameters are saved inside each
@@ -468,6 +479,11 @@ Implementations:
 
 Both architectures use the same split, normalization, temporal backbone, training loop, losses and
 evaluation protocol.
+
+When `model.use_ball=true`, both architectures concatenate five additional per-frame values:
+normalized ball X/Y, normalized ball speed, location validity and speed validity. WCSF ball speed
+is backward displacement at 10 Hz and resets at halftime. Metrica keeps its provider-reported
+speed from the selected 25 Hz frame; missing location or speed is never interpolated.
 
 ### 10.1 Team statistics TCN
 
@@ -809,7 +825,9 @@ without changing losses, predictions or metrics.
 - Home/Away possession labels may encode provider-specific semantics, especially around stoppages.
 - WCSF player and speed coverage is nearly complete, unlike Metrica.
 - WCSF reported speed is provider-smoothed and may not be measurement-equivalent to Metrica speed.
-- The tracking-only H/A/D model has no ball position, which is a major limitation for possession.
+- Ball-free H/A/D models lack direct ball evidence. Ball-enabled models address this but face a
+  strong domain shift: WCSF ball location is complete, while Metrica location and especially
+  provider speed are frequently missing.
 - Noncausal inference is appropriate for offline reconstruction but not real-time deployment.
 - Fixed binary threshold 0.5 is not calibrated or tuned.
 - No augmentation, temporal smoothing, structured decoding, pseudo-labeling or confidence calibration
@@ -821,7 +839,8 @@ without changing losses, predictions or metrics.
 
 | Responsibility | File |
 |---|---|
-| WCSF player/team features | `feature_engineering/wcsf_features.py` |
+| WCSF player/team/optional ball features | `feature_engineering/wcsf_features.py` |
+| Metrica compatible player/team/optional ball features | `feature_engineering/metrica_features.py` |
 | Strict binary labels | `feature_engineering/wcsf_labels.py` |
 | Strict H/A/D labels | `feature_engineering/wcsf_had_labels.py` |
 | Configuration and RF validation | `modeling/alive_dead/config.py` |

@@ -37,6 +37,7 @@ class SplitConfig:
 class ModelConfig:
     model_type: str = "team_tcn"
     classification_mode: str = "binary"
+    use_ball: bool = False
     temporal_channels: int = 64
     player_hidden_dim: int = 32
     player_embedding_dim: int = 32
@@ -96,6 +97,8 @@ class ExperimentConfig:
             raise ValueError("model_type must be 'team_tcn' or 'deepsets_tcn'")
         if self.model.classification_mode not in ("binary", "had"):
             raise ValueError("classification_mode must be 'binary' or 'had'")
+        if not isinstance(self.model.use_ball, bool):
+            raise ValueError("use_ball must be Boolean")
         if self.model.kernel_size < 1 or self.model.kernel_size % 2 == 0:
             raise ValueError("kernel_size must be a positive odd integer")
         if self.model.convolutions_per_block < 1 or not self.model.dilations:

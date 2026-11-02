@@ -10,8 +10,5 @@
     "kernel_size": 3,
     "dilations": [1, 2, 4, 8],
     "convolutions_per_block": 2
-  },
-  "training": {
-    "output_dir": "data/open_data_groningen/model_runs/temporal_b_rf61_seq10"
   }
 }

@@ -15,7 +15,8 @@ final challenge evaluation or H/A ownership model.
 - `train.py` runs the three inner trainings, validation summaries and full-half refit.
 
 PyTorch is required but is intentionally not installed by this package. Install a build appropriate
-for the target CPU/CUDA environment before importing or running the modeling code.
+for the target CPU/CUDA environment, then install the remaining modeling dependencies with
+`pip install -r requirements-modeling.txt`.
 
 ## Inputs
 
@@ -111,11 +112,10 @@ larger than either the sequence or validation buffer.
 
 ## Training
 
-Defaults can be used directly:
+Train both outer folds into one timestamped run:
 
 ```powershell
-python -m modeling.alive_dead.train --fold 1 --model-type team_tcn
-python -m modeling.alive_dead.train --fold 2 --model-type deepsets_tcn
+python -m modeling.alive_dead.train --config configs/alive_dead/temporal_d_rf125_seq20.json --fold all --model-type deepsets_tcn --classification-mode had
 ```
 
 Or provide a JSON file containing any nested `data`, `split`, `model` or `training` dataclass
@@ -132,16 +132,26 @@ Their median best epoch becomes the fixed refit length. The refit starts from ne
 the complete training half, constant configured learning rate and no validation-dependent
 scheduler. Training constructs no test DataLoader and never performs outer-test inference.
 
-Artifacts are kept separate from legacy single-block runs:
+The command prints the created run path. Run names contain the task, receptive field, sequence
+duration and local creation time. `run_metadata.json` records the complete resolved configuration
+and methodological decisions:
 
 ```text
-fold1_team_tcn_seed42/
-  inner_block1/history.json, best_checkpoint.pt, evaluation_validation.json
-  inner_block2/history.json, best_checkpoint.pt, evaluation_validation.json
-  inner_block3/history.json, best_checkpoint.pt, evaluation_validation.json
-  cv_summary.json
-  refit/history.json, final_checkpoint.pt
+had_rf125_seq20_YYYYMMDD_HHMMSS/
+  run_metadata.json
+  fold1/
+    inner_block1/history.json, best_checkpoint.pt, evaluation_validation.json
+    inner_block2/history.json, best_checkpoint.pt, evaluation_validation.json
+    inner_block3/history.json, best_checkpoint.pt, evaluation_validation.json
+    cv_summary.json
+    refit/history.json, final_checkpoint.pt
+  fold2/
+    ...
+  evaluation/
 ```
+
+Training shows fold, block, epoch and batch progress with running loss. Pass `--no-progress` for
+redirected output or automation.
 
 ## Evaluation
 
@@ -149,15 +159,15 @@ Evaluation is checkpoint-based and restores the saved normalizer without refitti
 evaluation use the final full-half refit checkpoint:
 
 ```powershell
-python -m modeling.alive_dead.evaluate --fold 1 --model-type team_tcn --partition test
-python -m modeling.alive_dead.evaluate --fold 2 --model-type deepsets_tcn --partition train
+python -m modeling.alive_dead.evaluate --run-dir <run-folder> --fold 1 --partition test
+python -m modeling.alive_dead.evaluate --run-dir <run-folder> --fold 2 --partition train
 ```
 
 Refit models have no validation partition. Evaluate one or all inner validation checkpoints with:
 
 ```powershell
-python -m modeling.alive_dead.evaluate --fold 1 --model-type team_tcn --partition validation --inner-block 1
-python -m modeling.alive_dead.evaluate --fold 1 --model-type team_tcn --partition validation --inner-block all
+python -m modeling.alive_dead.evaluate --run-dir <run-folder> --fold 1 --partition validation --inner-block 1
+python -m modeling.alive_dead.evaluate --run-dir <run-folder> --fold 1 --partition validation --inner-block all
 ```
 
 Each genuinely contiguous partition segment is inferred as one sequence, so temporal metrics are
@@ -166,8 +176,7 @@ never calculated independently per training window and no segment crosses a buff
 After both folds have been trained, combine their held-out predictions with:
 
 ```powershell
-python -m modeling.alive_dead.evaluate --fold all --model-type team_tcn
-python -m modeling.alive_dead.evaluate --fold all --model-type deepsets_tcn
+python -m modeling.alive_dead.evaluate --run-dir <run-folder> --fold all
 ```
 
 The combined out-of-fold result uses Fold 2 to predict the first half and Fold 1 to predict the
@@ -177,11 +186,10 @@ Add `--save-timeline` to any evaluation command to save a diagnostic PNG with al
 and prediction segments. For combined OOF evaluation, the first half is shown above the second:
 
 ```powershell
-python -m modeling.alive_dead.evaluate --fold all --model-type deepsets_tcn --save-timeline
+python -m modeling.alive_dead.evaluate --run-dir <run-folder> --fold all --save-timeline
 ```
 
-The combined figure is saved as `oof_<model_type>_seed<seed>_timeline.png` in the selected
-model-runs directory. Single-fold figures are saved beside the checkpoint they evaluate. Blank
+The combined figure is saved as `evaluation/oof_timeline.png` in the run directory. Blank
 timeline areas indicate disconnected or excluded intervals and are never joined artificially.
 
 Predictions use a fixed threshold of `sigmoid(logit) >= 0.5`. Reports contain accuracy, binary
@@ -194,8 +202,7 @@ over thresholds `0.3, 0.4, 0.5, 0.6, 0.7`. F1@0.5 is also reported as the headli
 Unlike the official possession score, this binary diagnostic includes DEAD segments and cannot
 separate consecutive Home and Away possessions inside one uninterrupted ALIVE interval.
 
-Individual reports are saved beside the checkpoint they evaluate. Combined reports are saved as
-`oof_<model_type>_seed<seed>.json` in the model-runs directory. Inner validation evaluation runs
+Evaluation reports and figures are saved under the run's `evaluation/` directory. Inner validation evaluation runs
 during cross-validation; outer train/test evaluation remains a separate explicit command.
 
 ### Metrica transfer evaluation
@@ -204,7 +211,7 @@ The same evaluator can apply both frozen WCSF refit checkpoints to the label-fre
 features and score the public five-minute annotation at its original 25 Hz rate:
 
 ```powershell
-python -m modeling.alive_dead.evaluate --dataset metrica --fold all --model-type deepsets_tcn --runs-dir data/open_data_groningen/model_runs/temporal_e_rf125_seq25
+python -m modeling.alive_dead.evaluate --dataset metrica --run-dir <alive-dead-run-folder> --fold all
 ```
 
 Each checkpoint uses its own saved WCSF normalizer; no statistics are fitted on Metrica. The two
@@ -262,16 +269,13 @@ the H/A/D archive when no JSON config is supplied):
 ```
 
 ```powershell
-python -m modeling.alive_dead.train --fold 1 --model-type deepsets_tcn --classification-mode had
-python -m modeling.alive_dead.evaluate_had --fold 1 --model-type deepsets_tcn --partition test
-python -m modeling.alive_dead.evaluate_had --fold all --model-type deepsets_tcn
+python -m modeling.alive_dead.train --fold all --model-type deepsets_tcn --classification-mode had
+python -m modeling.alive_dead.evaluate_had --run-dir <had-run-folder> --fold 1 --partition test
+python -m modeling.alive_dead.evaluate_had --run-dir <had-run-folder> --fold all
 ```
 
-H/A/D runs are stored separately as `fold<fold>_<model>_had_seed<seed>`. Strict binary runs use
-`fold<fold>_<model>_strict_seed<seed>`, preventing either task from overwriting legacy binary
-checkpoints. Binary WCSF evaluation selects strict runs by default; pass `--label-policy legacy`
-to reproduce a historical majority-voted run. Metrica binary transfer continues to use the
-legacy ALIVE/DEAD checkpoints.
+The evaluator reads task, architecture and seed from `run_metadata.json`; it does not reconstruct
+checkpoint paths from command-line naming arguments.
 
 H/A/D evaluation reports frame accuracy, macro F1, per-class precision/recall/F1, a 3x3
 confusion matrix, and the official one-to-one possession-spell F1 at IoUs 0.3 through 0.7.

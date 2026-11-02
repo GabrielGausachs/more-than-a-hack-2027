@@ -15,6 +15,13 @@ from .config import ExperimentConfig
 from .dataset import WCSFData, load_wcsf_data, normalize_wcsf_data
 from .inference import predict_segment_logits
 from .preprocessing import FeatureNormalizer
+from .progress import progress
+from .runs import (
+    evaluation_dir,
+    fold_checkpoint_path,
+    inner_checkpoint_path as run_inner_checkpoint_path,
+    load_run_metadata,
+)
 from .splits import (
     FoldSplit,
     Segment,
@@ -360,32 +367,6 @@ def validate_run_coverage(
         raise ValueError(f"Predictions do not exactly cover the {partition} partition")
 
 
-def checkpoint_path(
-    runs_dir: str | Path, fold: int, model_type: str, seed: int,
-    strict_labels: bool = False,
-) -> Path:
-    suffix = "_strict" if strict_labels else ""
-    return (
-        Path(runs_dir)
-        / f"fold{fold}_{model_type}{suffix}_seed{seed}"
-        / "refit"
-        / "final_checkpoint.pt"
-    )
-
-
-def inner_checkpoint_path(
-    runs_dir: str | Path, fold: int, model_type: str, seed: int, validation_block: int,
-    strict_labels: bool = False,
-) -> Path:
-    suffix = "_strict" if strict_labels else ""
-    return (
-        Path(runs_dir)
-        / f"fold{fold}_{model_type}{suffix}_seed{seed}"
-        / f"inner_block{validation_block}"
-        / "best_checkpoint.pt"
-    )
-
-
 def evaluate_checkpoint(
     path: str | Path,
     expected_fold: int,
@@ -395,6 +376,7 @@ def evaluate_checkpoint(
     device_name: str = "auto",
     training_mode: str = "full_half_refit",
     validation_block: int | None = None,
+    show_progress: bool = False,
 ) -> CheckpointEvaluation:
     """Load a best checkpoint and evaluate one fold partition."""
     if partition not in ("train", "validation", "test"):
@@ -442,9 +424,18 @@ def evaluate_checkpoint(
     model = build_model(config.model).to(device)
     model.load_state_dict(checkpoint["model_state"], strict=True)
     model.eval()
+    segments = split.segments[partition]
+    segment_iter = progress(
+        segments,
+        enabled=show_progress,
+        total=len(segments),
+        desc=f"Fold {expected_fold} {partition}",
+        unit="segment",
+        leave=False,
+    )
     runs = tuple(
         run
-        for segment in split.segments[partition]
+        for segment in segment_iter
         for run in _predict_valid_runs(model, data, segment, device)
     )
     validate_run_coverage(
@@ -519,27 +510,30 @@ def combine_oof_runs(
 
 
 def _evaluate_oof_with_runs(
-    model_type: str,
-    seed: int,
-    runs_dir: str | Path,
+    run_dir: str | Path,
     device_name: str = "auto",
-    strict_labels: bool = False,
+    show_progress: bool = False,
 ) -> tuple[Dict[str, object], tuple[PredictionRun, ...]]:
+    metadata = load_run_metadata(run_dir, "alive_dead")
+    model_type = str(metadata["model_type"])
+    seed = int(metadata["seed"])
     fold1 = evaluate_checkpoint(
-        checkpoint_path(runs_dir, 1, model_type, seed, strict_labels),
+        fold_checkpoint_path(run_dir, 1),
         1,
         model_type,
         seed,
         "test",
         device_name,
+        show_progress=show_progress,
     )
     fold2 = evaluate_checkpoint(
-        checkpoint_path(runs_dir, 2, model_type, seed, strict_labels),
+        fold_checkpoint_path(run_dir, 2),
         2,
         model_type,
         seed,
         "test",
         device_name,
+        show_progress=show_progress,
     )
     runs = combine_oof_runs(fold1, fold2)
     report = {
@@ -563,34 +557,35 @@ def _evaluate_oof_with_runs(
 
 
 def evaluate_oof(
-    model_type: str,
-    seed: int,
-    runs_dir: str | Path,
+    run_dir: str | Path,
     device_name: str = "auto",
-    strict_labels: bool = False,
+    show_progress: bool = False,
 ) -> Dict[str, object]:
     """Evaluate both held-out halves and return the combined OOF report."""
     report, _ = _evaluate_oof_with_runs(
-        model_type, seed, runs_dir, device_name, strict_labels
+        run_dir, device_name, show_progress
     )
     return report
 
 
 def _evaluate_inner_blocks_with_runs(
     fold: int,
-    model_type: str,
-    seed: int,
-    runs_dir: str | Path,
+    run_dir: str | Path,
     device_name: str = "auto",
-    strict_labels: bool = False,
+    show_progress: bool = False,
 ) -> tuple[Dict[str, object], Dict[str, CheckpointEvaluation]]:
     """Evaluate all three inner validation checkpoints without touching test data."""
+    metadata = load_run_metadata(run_dir, "alive_dead")
+    model_type = str(metadata["model_type"])
+    seed = int(metadata["seed"])
     evaluations: Dict[str, CheckpointEvaluation] = {}
-    for block in (1, 2, 3):
+    blocks = progress(
+        (1, 2, 3), enabled=show_progress, total=3,
+        desc=f"Fold {fold} inner validation", unit="block", leave=False,
+    )
+    for block in blocks:
         result = evaluate_checkpoint(
-            inner_checkpoint_path(
-                runs_dir, fold, model_type, seed, block, strict_labels
-            ),
+            run_inner_checkpoint_path(run_dir, fold, block),
             fold,
             model_type,
             seed,
@@ -598,6 +593,7 @@ def _evaluate_inner_blocks_with_runs(
             device_name,
             training_mode="inner_cv",
             validation_block=block,
+            show_progress=show_progress,
         )
         evaluations[str(block)] = result
     report = {
@@ -623,15 +619,13 @@ def _evaluate_inner_blocks_with_runs(
 
 def evaluate_inner_blocks(
     fold: int,
-    model_type: str,
-    seed: int,
-    runs_dir: str | Path,
+    run_dir: str | Path,
     device_name: str = "auto",
-    strict_labels: bool = False,
+    show_progress: bool = False,
 ) -> Dict[str, object]:
     """Evaluate all inner blocks and return their aggregate report."""
     report, _ = _evaluate_inner_blocks_with_runs(
-        fold, model_type, seed, runs_dir, device_name, strict_labels
+        fold, run_dir, device_name, show_progress
     )
     return report
 
@@ -900,22 +894,27 @@ def _score_metrica_probabilities(
 
 
 def evaluate_metrica_transfer(
-    model_type: str,
-    seed: int,
-    runs_dir: str | Path,
+    run_dir: str | Path,
     feature_path: str | Path,
     ground_truth_path: str | Path,
     device_name: str = "auto",
+    show_progress: bool = False,
 ) -> tuple[Dict[str, object], Dict[str, np.ndarray], tuple[PredictionRun, ...]]:
     """Evaluate two frozen WCSF refit checkpoints on Metrica's public labels."""
+    metadata = load_run_metadata(run_dir, "alive_dead")
+    model_type = str(metadata["model_type"])
+    seed = int(metadata["seed"])
     features = load_metrica_features(feature_path)
     device = select_device(device_name)
     fold_probabilities: Dict[int, np.ndarray] = {}
     configs: Dict[int, ExperimentConfig] = {}
     checkpoints: Dict[int, Mapping[str, object]] = {}
     paths: Dict[int, Path] = {}
-    for fold in (1, 2):
-        path = checkpoint_path(runs_dir, fold, model_type, seed)
+    for fold in progress(
+        (1, 2), enabled=show_progress, total=2,
+        desc="Metrica checkpoints", unit="fold"
+    ):
+        path = fold_checkpoint_path(run_dir, fold)
         probabilities, config, checkpoint = _infer_metrica_checkpoint(
             path, fold, model_type, seed, features, device
         )
@@ -1038,21 +1037,13 @@ def _write_json(path: Path, report: Mapping[str, object]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dataset", default="wcsf", choices=("wcsf", "metrica")
-    )
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--dataset", default="wcsf", choices=("wcsf", "metrica"))
     parser.add_argument("--fold", required=True, choices=("1", "2", "all"))
-    parser.add_argument(
-        "--model-type", required=True, choices=("team_tcn", "deepsets_tcn")
-    )
     parser.add_argument(
         "--partition", default="test", choices=("train", "validation", "test")
     )
     parser.add_argument("--inner-block", choices=("1", "2", "3", "all"))
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--runs-dir", type=Path, default=Path("data/open_data_groningen/model_runs")
-    )
     parser.add_argument(
         "--metrica-features",
         type=Path,
@@ -1064,18 +1055,18 @@ def main() -> None:
         default=Path("evaluation/gt/BAR-ATH_possession_gt_public.csv"),
     )
     parser.add_argument("--device", default="auto")
-    parser.add_argument(
-        "--label-policy",
-        choices=("strict", "legacy"),
-        default="strict",
-        help="WCSF binary checkpoint family; Metrica transfer always uses legacy runs",
-    )
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument(
         "--save-timeline",
         action="store_true",
         help="Save ground-truth and prediction segment timelines",
     )
     args = parser.parse_args()
+    metadata = load_run_metadata(args.run_dir, "alive_dead")
+    model_type = str(metadata["model_type"])
+    seed = int(metadata["seed"])
+    output_dir = evaluation_dir(args.run_dir)
+    show_progress = not args.no_progress
 
     if args.dataset == "metrica":
         if args.fold != "all":
@@ -1083,17 +1074,15 @@ def main() -> None:
         if args.partition != "test" or args.inner_block is not None:
             parser.error("Metrica transfer evaluation does not use WCSF partitions")
         report, predictions, runs = evaluate_metrica_transfer(
-            args.model_type,
-            args.seed,
-            args.runs_dir,
+            args.run_dir,
             args.metrica_features,
             args.metrica_ground_truth,
             args.device,
+            show_progress,
         )
-        stem = f"metrica_{args.model_type}_seed{args.seed}_alive_dead"
-        report_path = args.runs_dir / f"{stem}_evaluation.json"
-        prediction_path = args.runs_dir / f"{stem}_predictions.npz"
-        timeline_path = args.runs_dir / f"{stem}_timeline.png"
+        report_path = output_dir / "metrica_alive_dead.json"
+        prediction_path = output_dir / "metrica_alive_dead_predictions.npz"
+        timeline_path = output_dir / "metrica_alive_dead_timeline.png"
         _write_json(report_path, report)
         np.savez_compressed(prediction_path, **predictions)
         from .plotting import save_prediction_timeline
@@ -1102,7 +1091,7 @@ def main() -> None:
             runs,
             float(report["evaluation_source_fps"]),
             timeline_path,
-            f"Metrica public ALIVE/DEAD transfer: {args.model_type}",
+            f"Metrica public ALIVE/DEAD transfer: {model_type}",
         )
         for fold, result in report["fold_diagnostics"].items():
             _print_metrics(f"Metrica transfer: Fold {fold} checkpoint", result)
@@ -1120,8 +1109,6 @@ def main() -> None:
         return
 
     timeline_jobs = []
-    strict_labels = args.label_policy == "strict"
-    family_suffix = "_strict" if strict_labels else ""
 
     if args.fold == "all":
         if args.inner_block is not None:
@@ -1130,25 +1117,24 @@ def main() -> None:
             parser.error("--fold all only supports the held-out test partition")
         if args.save_timeline:
             report, runs = _evaluate_oof_with_runs(
-                args.model_type, args.seed, args.runs_dir, args.device, strict_labels
+                args.run_dir, args.device, show_progress
             )
             timeline_jobs.append(
                 (
                     runs,
                     float(report["source_fps"]),
-                    args.runs_dir
-                    / f"oof_{args.model_type}{family_suffix}_seed{args.seed}_timeline.png",
-                    f"Combined OOF: {args.model_type}",
+                    output_dir / "oof_timeline.png",
+                    f"Combined OOF: {model_type}",
                 )
             )
         else:
             report = evaluate_oof(
-                args.model_type, args.seed, args.runs_dir, args.device, strict_labels
+                args.run_dir, args.device, show_progress
             )
         _print_metrics("Fold 1 held-out test", report["fold_results"]["1"])
         _print_metrics("Fold 2 held-out test", report["fold_results"]["2"])
         _print_metrics("Combined out-of-fold", report["combined"])
-        output_path = args.runs_dir / f"oof_{args.model_type}{family_suffix}_seed{args.seed}.json"
+        output_path = output_dir / "oof.json"
     else:
         fold = int(args.fold)
         if args.inner_block is not None:
@@ -1157,44 +1143,38 @@ def main() -> None:
             if args.inner_block == "all":
                 if args.save_timeline:
                     report, block_evaluations = _evaluate_inner_blocks_with_runs(
-                        fold, args.model_type, args.seed, args.runs_dir, args.device,
-                        strict_labels,
+                        fold, args.run_dir, args.device, show_progress
                     )
                     for block, result in block_evaluations.items():
                         timeline_jobs.append(
                             (
                                 result.runs,
                                 result.source_fps,
-                                result.checkpoint_path.parent / "timeline_validation.png",
-                                f"Fold {fold} inner block {block} validation: {args.model_type}",
+                                output_dir / f"fold{fold}_inner_block{block}_timeline.png",
+                                f"Fold {fold} inner block {block} validation: {model_type}",
                             )
                         )
                 else:
                     report = evaluate_inner_blocks(
-                        fold, args.model_type, args.seed, args.runs_dir, args.device,
-                        strict_labels,
+                        fold, args.run_dir, args.device, show_progress
                     )
                 for block, block_report in report["blocks"].items():
                     _print_metrics(f"Fold {fold} inner block {block}", block_report)
                 output_path = (
-                    args.runs_dir
-                    / f"fold{fold}_{args.model_type}{family_suffix}_seed{args.seed}"
-                    / "evaluation_inner_validation.json"
+                    output_dir / f"fold{fold}_inner_validation.json"
                 )
             else:
                 block = int(args.inner_block)
                 evaluation = evaluate_checkpoint(
-                    inner_checkpoint_path(
-                        args.runs_dir, fold, args.model_type, args.seed, block,
-                        strict_labels,
-                    ),
+                    run_inner_checkpoint_path(args.run_dir, fold, block),
                     fold,
-                    args.model_type,
-                    args.seed,
+                    model_type,
+                    seed,
                     "validation",
                     args.device,
                     training_mode="inner_cv",
                     validation_block=block,
+                    show_progress=show_progress,
                 )
                 report = evaluation.report
                 if args.save_timeline:
@@ -1202,26 +1182,25 @@ def main() -> None:
                         (
                             evaluation.runs,
                             evaluation.source_fps,
-                            evaluation.checkpoint_path.parent / "timeline_validation.png",
-                            f"Fold {fold} inner block {block} validation: {args.model_type}",
+                            output_dir / f"fold{fold}_inner_block{block}_timeline.png",
+                            f"Fold {fold} inner block {block} validation: {model_type}",
                         )
                     )
                 _print_metrics(f"Fold {fold} inner block {block}", report)
                 output_path = (
-                    evaluation.checkpoint_path.parent / "evaluation_validation.json"
+                    output_dir / f"fold{fold}_inner_block{block}_validation.json"
                 )
         else:
             if args.partition == "validation":
                 parser.error("Refit models have no validation partition; use --inner-block")
             evaluation = evaluate_checkpoint(
-                checkpoint_path(
-                    args.runs_dir, fold, args.model_type, args.seed, strict_labels
-                ),
+                fold_checkpoint_path(args.run_dir, fold),
                 fold,
-                args.model_type,
-                args.seed,
+                model_type,
+                seed,
                 args.partition,
                 args.device,
+                show_progress=show_progress,
             )
             report = evaluation.report
             if args.save_timeline:
@@ -1229,14 +1208,13 @@ def main() -> None:
                     (
                         evaluation.runs,
                         evaluation.source_fps,
-                        evaluation.checkpoint_path.parent
-                        / f"timeline_{args.partition}.png",
-                        f"Fold {fold} {args.partition}: {args.model_type}",
+                        output_dir / f"fold{fold}_{args.partition}_timeline.png",
+                        f"Fold {fold} {args.partition}: {model_type}",
                     )
                 )
             _print_metrics(f"Fold {fold} refit {args.partition}", report)
             output_path = (
-                evaluation.checkpoint_path.parent / f"evaluation_{args.partition}.json"
+                output_dir / f"fold{fold}_{args.partition}.json"
             )
 
     _write_json(output_path, report)

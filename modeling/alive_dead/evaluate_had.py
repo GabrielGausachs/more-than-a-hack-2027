@@ -16,6 +16,13 @@ from evaluation import possession_metrics as pm
 from .dataset import WCSFData, load_wcsf_data, normalize_wcsf_data
 from .evaluate import normalizer_from_state, select_device, validate_checkpoint
 from .inference import predict_segment_logits
+from .progress import progress
+from .runs import (
+    evaluation_dir,
+    fold_checkpoint_path,
+    inner_checkpoint_path,
+    load_run_metadata,
+)
 from .splits import (
     FoldSplit,
     Segment,
@@ -215,6 +222,7 @@ def evaluate_had_checkpoint(
     device_name: str = "auto",
     training_mode: str = "full_half_refit",
     validation_block: int | None = None,
+    show_progress: bool = False,
 ) -> HADEvaluation:
     if partition not in ("train", "validation", "test"):
         raise ValueError("partition must be train, validation or test")
@@ -255,9 +263,18 @@ def evaluate_had_checkpoint(
     model = build_model(config.model).to(device)
     model.load_state_dict(checkpoint["model_state"], strict=True)
     model.eval()
+    segments = split.segments[partition]
+    segment_iter = progress(
+        segments,
+        enabled=show_progress,
+        total=len(segments),
+        desc=f"Fold {expected_fold} {partition}",
+        unit="segment",
+        leave=False,
+    )
     runs = tuple(
         run
-        for segment in split.segments[partition]
+        for segment in segment_iter
         for run in _predict_valid_runs(model, data, segment, device)
     )
     _validate_coverage(runs, split, partition, raw.label_valid)
@@ -297,27 +314,23 @@ def evaluate_had_checkpoint(
     )
 
 
-def had_checkpoint_path(
-    runs_dir: str | Path, fold: int, model_type: str, seed: int
-) -> Path:
-    return (
-        Path(runs_dir)
-        / f"fold{fold}_{model_type}_had_seed{seed}"
-        / "refit"
-        / "final_checkpoint.pt"
-    )
-
-
 def evaluate_had_oof(
-    model_type: str, seed: int, runs_dir: str | Path, device_name: str = "auto"
+    run_dir: str | Path,
+    device_name: str = "auto",
+    show_progress: bool = False,
 ) -> Dict[str, object]:
+    metadata = load_run_metadata(run_dir, "had")
+    model_type = str(metadata["model_type"])
+    seed = int(metadata["seed"])
     fold1 = evaluate_had_checkpoint(
-        had_checkpoint_path(runs_dir, 1, model_type, seed),
+        fold_checkpoint_path(run_dir, 1),
         1, model_type, seed, "test", device_name,
+        show_progress=show_progress,
     )
     fold2 = evaluate_had_checkpoint(
-        had_checkpoint_path(runs_dir, 2, model_type, seed),
+        fold_checkpoint_path(run_dir, 2),
         2, model_type, seed, "test", device_name,
+        show_progress=show_progress,
     )
     if not np.array_equal(fold1.label_valid, fold2.label_valid):
         raise ValueError("OOF H/A/D checkpoints use different label masks")
@@ -351,38 +364,61 @@ def evaluate_had_oof(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--fold", required=True, choices=("1", "2", "all"))
-    parser.add_argument("--model-type", required=True, choices=("team_tcn", "deepsets_tcn"))
     parser.add_argument("--partition", choices=("train", "validation", "test"), default="test")
     parser.add_argument("--inner-block", type=int, choices=(1, 2, 3))
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--runs-dir", type=Path, default=Path("data/open_data_groningen/model_runs"))
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
+    metadata = load_run_metadata(args.run_dir, "had")
+    model_type = str(metadata["model_type"])
+    seed = int(metadata["seed"])
+    output_dir = evaluation_dir(args.run_dir)
+    show_progress = not args.no_progress
     if args.fold == "all":
-        report = evaluate_had_oof(args.model_type, args.seed, args.runs_dir, args.device)
-        output = args.runs_dir / f"oof_{args.model_type}_had_seed{args.seed}.json"
+        if args.partition != "test" or args.inner_block is not None:
+            parser.error("--fold all only supports the held-out test partition")
+        report = evaluate_had_oof(args.run_dir, args.device, show_progress)
+        output = output_dir / "oof.json"
     else:
         fold = int(args.fold)
         training_mode = "inner_cv" if args.inner_block else "full_half_refit"
         if args.partition == "validation" and args.inner_block is None:
             parser.error("validation requires --inner-block")
-        parent = args.runs_dir / f"fold{fold}_{args.model_type}_had_seed{args.seed}"
         path = (
-            parent / f"inner_block{args.inner_block}" / "best_checkpoint.pt"
+            inner_checkpoint_path(args.run_dir, fold, args.inner_block)
             if args.inner_block
-            else parent / "refit" / "final_checkpoint.pt"
+            else fold_checkpoint_path(args.run_dir, fold)
         )
         evaluation = evaluate_had_checkpoint(
-            path, fold, args.model_type, args.seed, args.partition, args.device,
-            training_mode, args.inner_block,
+            path, fold, model_type, seed, args.partition, args.device,
+            training_mode, args.inner_block, show_progress,
         )
         report = evaluation.report
-        output = path.parent / f"evaluation_{args.partition}.json"
+        suffix = (
+            f"inner_block{args.inner_block}_{args.partition}"
+            if args.inner_block
+            else args.partition
+        )
+        output = output_dir / f"fold{fold}_{suffix}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
-    print(json.dumps(report, indent=2))
+    frame = (
+        report["combined"]["frame_metrics"]
+        if args.fold == "all"
+        else report["frame_metrics"]
+    )
+    spells = (
+        report["combined"]["spell_metrics"]
+        if args.fold == "all"
+        else report["spell_metrics"]
+    )
+    print(f"Accuracy: {frame['accuracy']:.4f}")
+    print(f"Macro F1: {frame['macro_f1']:.4f}")
+    print(f"Possession spell F1: {spells['mean_f1']:.4f}")
+    print(f"Saved: {output}")
 
 
 if __name__ == "__main__":

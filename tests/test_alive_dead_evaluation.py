@@ -12,18 +12,17 @@ from modeling.alive_dead.evaluate import (
     PredictionRun,
     average_fold_probabilities,
     combine_oof_runs,
-    checkpoint_path,
     compute_frame_metrics,
     compute_segment_metrics,
     extract_segments,
     normalizer_from_state,
     official_binary_metrics,
-    inner_checkpoint_path,
     reconstruct_source_predictions,
     validate_checkpoint,
     validate_run_coverage,
     validate_transfer_configs,
 )
+from modeling.alive_dead.runs import fold_checkpoint_path, inner_checkpoint_path
 from modeling.alive_dead.splits import build_fold_split
 
 
@@ -118,19 +117,15 @@ class CheckpointAndCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "model type"):
             validate_checkpoint(self._checkpoint(), 1, "deepsets_tcn", 42)
 
-    def test_new_paths_never_select_legacy_root_checkpoint(self):
+    def test_run_paths_do_not_reconstruct_legacy_names(self):
         root = Path("runs")
         self.assertEqual(
-            checkpoint_path(root, 1, "team_tcn", 42),
-            root / "fold1_team_tcn_seed42/refit/final_checkpoint.pt",
+            fold_checkpoint_path(root, 1),
+            root / "fold1/refit/final_checkpoint.pt",
         )
         self.assertEqual(
-            inner_checkpoint_path(root, 1, "team_tcn", 42, 3),
-            root / "fold1_team_tcn_seed42/inner_block3/best_checkpoint.pt",
-        )
-        self.assertEqual(
-            checkpoint_path(root, 1, "team_tcn", 42, strict_labels=True),
-            root / "fold1_team_tcn_strict_seed42/refit/final_checkpoint.pt",
+            inner_checkpoint_path(root, 1, 3),
+            root / "fold1/inner_block3/best_checkpoint.pt",
         )
 
     def test_training_mode_and_block_mismatch_are_rejected(self):

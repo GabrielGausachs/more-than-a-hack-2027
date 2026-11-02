@@ -1,9 +1,12 @@
 """Lightweight integrity tests for the ALIVE/DEAD modeling package."""
 
+import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
 from unittest import mock
 
 import numpy as np
@@ -18,6 +21,7 @@ from modeling.alive_dead.dataset import (
 )
 from modeling.alive_dead.inference import predict_segment_logits
 from modeling.alive_dead.player_encoder import DeepSetPlayerEncoder
+from modeling.alive_dead.progress import progress
 from modeling.alive_dead.preprocessing import FeatureNormalizer
 from modeling.alive_dead.splits import Segment, build_fold_split, build_refit_split
 from modeling.alive_dead.tcn import build_model
@@ -27,6 +31,7 @@ from modeling.alive_dead.train import (
     validate_full_segments,
 )
 from modeling.alive_dead.train import run_cross_validation
+from modeling.alive_dead.runs import create_run_directory, load_run_metadata, run_name
 
 
 def synthetic_data(n_frames=24):
@@ -489,7 +494,7 @@ class CrossValidationWorkflowTests(unittest.TestCase):
         config.model.model_type = "team_tcn"
         best_epochs = {1: 5, 2: 9, 3: 7}
 
-        def fake_train(inner_config, run_dir):
+        def fake_train(inner_config, run_dir, show_progress=False):
             run_dir = Path(run_dir)
             run_dir.mkdir(parents=True, exist_ok=True)
             block = inner_config.split.validation_block
@@ -518,15 +523,56 @@ class CrossValidationWorkflowTests(unittest.TestCase):
                 "modeling.alive_dead.train.train_full_half_refit",
                 return_value={"checkpoint_path": "final_checkpoint.pt"},
             ) as refit:
-                summary = run_cross_validation(config)
+                parent = Path(temporary) / "fold1"
+                summary = run_cross_validation(config, parent)
 
             self.assertEqual(inner_train.call_count, 3)
             self.assertEqual(summary["inner_best_epochs"], [5, 9, 7])
             self.assertEqual(summary["refit_epochs"], 7)
             self.assertEqual(refit.call_args.args[1], 7)
             self.assertTrue(
-                (Path(temporary) / "fold1_team_tcn_strict_seed42/cv_summary.json").exists()
+                (Path(temporary) / "fold1/cv_summary.json").exists()
             )
+
+
+class TimestampedRunTests(unittest.TestCase):
+    def test_name_and_metadata_include_temporal_decisions(self):
+        config = ExperimentConfig()
+        config.model.classification_mode = "had"
+        config.model.model_type = "deepsets_tcn"
+        config.data.sequence_seconds = 20.0
+        config.data.train_stride_seconds = 5.0
+        config.split.buffer_seconds = 15.0
+        config.model.dilations = (1, 2, 4, 8, 16)
+        created = datetime(2026, 11, 2, 12, 20, 33, tzinfo=timezone.utc)
+        self.assertEqual(run_name(config, created), "had_rf125_seq20_20261102_122033")
+        with tempfile.TemporaryDirectory() as temporary:
+            config.training.output_dir = temporary
+            run_dir, _ = create_run_directory(config, (1, 2), created)
+            metadata = load_run_metadata(run_dir, "had")
+            self.assertEqual(metadata["temporal"]["sequence_frames"], 200)
+            self.assertEqual(metadata["temporal"]["train_stride_frames"], 50)
+            self.assertEqual(metadata["temporal"]["receptive_field_frames"], 125)
+            self.assertEqual(metadata["temporal"]["context_radius_frames"], 62)
+            self.assertEqual(metadata["temporal"]["buffer_frames"], 150)
+            with self.assertRaises(FileExistsError):
+                create_run_directory(config, (1, 2), created)
+
+
+class ProgressTests(unittest.TestCase):
+    def test_disabled_progress_is_a_no_op(self):
+        values = [1, 2, 3]
+        self.assertIs(progress(values, enabled=False), values)
+
+    def test_enabled_progress_wraps_without_changing_values(self):
+        tqdm_package = ModuleType("tqdm")
+        tqdm_auto = ModuleType("tqdm.auto")
+        tqdm_auto.tqdm = lambda iterable, **kwargs: list(iterable)
+        tqdm_package.auto = tqdm_auto
+        with mock.patch.dict(
+            sys.modules, {"tqdm": tqdm_package, "tqdm.auto": tqdm_auto}
+        ):
+            self.assertEqual(list(progress((1, 2), enabled=True)), [1, 2])
 
 
 if __name__ == "__main__":

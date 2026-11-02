@@ -584,7 +584,7 @@ the checkpoint within an inner run.
 
 ## 13. Three-block inner CV and full-half refit
 
-Running one training command performs the following for one outer fold and architecture:
+Within each outer fold requested by the training command, the pipeline performs:
 
 1. Train inner block 1 from a fresh initialization.
 2. Save its minimum-validation-loss checkpoint.
@@ -606,33 +606,28 @@ B-E. Those methodological choices must be compared using aggregate inner-validat
 
 ## 14. Saved artifacts and model identity
 
-Run identity includes fold, architecture, task/label policy and seed. Examples:
+One experiment now has a timestamped identity shared by both outer folds. Examples:
 
 ```text
-fold1_deepsets_tcn_strict_seed42
-fold2_team_tcn_had_seed42
+alive_dead_rf125_seq20_20261102_122033
+had_rf125_seq20_20261102_122033
 ```
 
-For each run:
+The architecture, seed, complete resolved configuration, temporal dimensions and methodological
+decisions are stored in `run_metadata.json` rather than encoded repeatedly in child paths:
 
 ```text
 <run>/
-  inner_block1/
-    history.json
-    best_checkpoint.pt
-    evaluation_validation.json
-  inner_block2/
-    history.json
-    best_checkpoint.pt
-    evaluation_validation.json
-  inner_block3/
-    history.json
-    best_checkpoint.pt
-    evaluation_validation.json
-  cv_summary.json
-  refit/
-    history.json
-    final_checkpoint.pt
+  run_metadata.json
+  fold1/
+    inner_block1/
+    inner_block2/
+    inner_block3/
+    cv_summary.json
+    refit/history.json, final_checkpoint.pt
+  fold2/
+    ...
+  evaluation/
 ```
 
 `history.json` contains epoch losses and learning rate. `cv_summary.json` contains block boundaries,
@@ -653,9 +648,9 @@ Checkpoints contain:
 - Validation block identity where applicable.
 - Inner best epochs for a final refit.
 
-Evaluation validates checkpoint fold, architecture, seed, training mode and block identity before
-loading weights. Historical configurations containing the removed `eval_stride_seconds` field are
-still accepted because evaluation inference no longer depends on validation-window stride.
+Evaluation reads run identity from the manifest and validates checkpoint fold, architecture, seed,
+training mode and block identity before loading weights. Historical checkpoint payloads remain
+readable, although new CLI evaluation requires a manifest-backed run directory.
 
 ## 15. Binary evaluation
 
@@ -760,37 +755,38 @@ Build strict H/A/D labels:
 python -m feature_engineering.wcsf_had_labels
 ```
 
-Train binary Deep Sets configuration D for each outer fold:
+Train binary Deep Sets configuration D for both outer folds:
 
 ```powershell
-python -m modeling.alive_dead.train --config configs/alive_dead/temporal_d_rf125_seq20.json --fold 1 --model-type deepsets_tcn --classification-mode binary
-python -m modeling.alive_dead.train --config configs/alive_dead/temporal_d_rf125_seq20.json --fold 2 --model-type deepsets_tcn --classification-mode binary
+python -m modeling.alive_dead.train --config configs/alive_dead/temporal_d_rf125_seq20.json --fold all --model-type deepsets_tcn --classification-mode binary
 ```
 
 Train H/A/D Deep Sets configuration D:
 
 ```powershell
-python -m modeling.alive_dead.train --config configs/alive_dead/temporal_d_rf125_seq20.json --fold 1 --model-type deepsets_tcn --classification-mode had
-python -m modeling.alive_dead.train --config configs/alive_dead/temporal_d_rf125_seq20.json --fold 2 --model-type deepsets_tcn --classification-mode had
+python -m modeling.alive_dead.train --config configs/alive_dead/temporal_d_rf125_seq20.json --fold all --model-type deepsets_tcn --classification-mode had
 ```
 
-Evaluate binary combined OOF results from a configuration-specific runs directory:
+Evaluate binary combined OOF results from the timestamped run printed by training:
 
 ```powershell
-python -m modeling.alive_dead.evaluate --dataset wcsf --fold all --model-type deepsets_tcn --runs-dir data/open_data_groningen/model_runs/temporal_d_rf125_seq20 --label-policy strict --save-timeline
+python -m modeling.alive_dead.evaluate --dataset wcsf --run-dir <alive-dead-run-folder> --fold all --save-timeline
 ```
 
 Evaluate binary inner validation:
 
 ```powershell
-python -m modeling.alive_dead.evaluate --dataset wcsf --fold 1 --model-type deepsets_tcn --partition validation --inner-block all --runs-dir data/open_data_groningen/model_runs/temporal_d_rf125_seq20 --label-policy strict
+python -m modeling.alive_dead.evaluate --dataset wcsf --run-dir <alive-dead-run-folder> --fold 1 --partition validation --inner-block all
 ```
 
 Evaluate H/A/D combined OOF results:
 
 ```powershell
-python -m modeling.alive_dead.evaluate_had --fold all --model-type deepsets_tcn --runs-dir data/open_data_groningen/model_runs/temporal_d_rf125_seq20
+python -m modeling.alive_dead.evaluate_had --run-dir <had-run-folder> --fold all
 ```
+
+Training and evaluation display `tqdm` progress by default. `--no-progress` disables terminal bars
+without changing losses, predictions or metrics.
 
 ## 18. Important methodological decisions and limitations
 
@@ -836,6 +832,7 @@ python -m modeling.alive_dead.evaluate_had --fold all --model-type deepsets_tcn 
 | TCN architectures | `modeling/alive_dead/tcn.py` |
 | Shared full/chunked inference | `modeling/alive_dead/inference.py` |
 | Training, checkpoint selection and refit | `modeling/alive_dead/train.py` |
+| Timestamped run metadata and paths | `modeling/alive_dead/runs.py` |
 | Binary evaluation and Metrica transfer | `modeling/alive_dead/evaluate.py` |
 | H/A/D evaluation | `modeling/alive_dead/evaluate_had.py` |
 | Binary timeline plotting | `modeling/alive_dead/plotting.py` |

@@ -19,6 +19,8 @@ from .config import ExperimentConfig, load_config
 from .dataset import LoaderBundle, WCSFData, build_dataloaders
 from .evaluate import evaluate_checkpoint, select_device
 from .inference import predict_segment_logits
+from .progress import progress, progress_write
+from .runs import create_run_directory, fold_dir, update_run_status
 from .splits import Segment
 from .tcn import build_model
 
@@ -27,20 +29,6 @@ from .tcn import build_model
 class EpochStats:
     loss: float
     effective_frames: float
-
-
-def experiment_name(config: ExperimentConfig) -> str:
-    """Return a task-safe run identity while preserving legacy binary paths."""
-    if config.model.classification_mode == "had":
-        task = "_had"
-    elif Path(config.data.label_path).stem.endswith("_strict"):
-        task = "_strict"
-    else:
-        task = ""
-    return (
-        f"fold{config.split.fold}_{config.model.model_type}{task}"
-        f"_seed{config.training.seed}"
-    )
 
 
 def set_reproducible_seed(seed: int) -> None:
@@ -123,12 +111,22 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     gradient_clip_norm: float | None = None,
     classification_mode: str = "binary",
+    show_progress: bool = False,
+    description: str = "Training",
 ) -> EpochStats:
     """Train for one epoch using center-supervised temporal windows."""
     model.train()
     total_numerator = 0.0
     total_denominator = 0.0
-    for cpu_batch in loader:
+    batches = progress(
+        loader,
+        enabled=show_progress,
+        total=len(loader),
+        desc=description,
+        unit="batch",
+        leave=False,
+    )
+    for cpu_batch in batches:
         batch = move_batch(cpu_batch, device)
         optimizer.zero_grad(set_to_none=True)
         logits = model(batch)
@@ -151,6 +149,8 @@ def train_epoch(
         optimizer.step()
         total_numerator += float(numerator.detach().cpu())
         total_denominator += float(denominator.detach().cpu())
+        if hasattr(batches, "set_postfix"):
+            batches.set_postfix(loss=f"{total_numerator / total_denominator:.4f}")
     if total_denominator <= 0:
         raise ValueError("Epoch produced no valid outputs")
     return EpochStats(total_numerator / total_denominator, total_denominator)
@@ -163,11 +163,21 @@ def validate_full_segments(
     device: torch.device,
     classification_mode: str,
     chunk_frames: int | None = None,
+    show_progress: bool = False,
+    description: str = "Validation",
 ) -> EpochStats:
     """Calculate mean validation loss from one prediction per valid frame."""
     total_numerator = 0.0
     total_frames = 0
-    for segment in segments:
+    segment_iter = progress(
+        segments,
+        enabled=show_progress,
+        total=len(segments),
+        desc=description,
+        unit="segment",
+        leave=False,
+    )
+    for segment in segment_iter:
         logits = predict_segment_logits(
             model,
             data.players,
@@ -230,7 +240,9 @@ def _checkpoint_payload(
 
 
 def train_experiment(
-    config: ExperimentConfig, run_dir: str | Path | None = None
+    config: ExperimentConfig,
+    run_dir: str | Path,
+    show_progress: bool = False,
 ) -> Dict[str, object]:
     """Train one inner validation block; held-out test data is never iterated."""
     set_reproducible_seed(config.training.seed)
@@ -249,12 +261,6 @@ def train_experiment(
         patience=config.training.scheduler_patience,
     )
 
-    if run_dir is None:
-        run_dir = (
-            Path(config.training.output_dir)
-            / experiment_name(config)
-            / f"inner_block{config.split.validation_block}"
-        )
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     history_path = run_dir / "history.json"
@@ -263,7 +269,15 @@ def train_experiment(
     best_validation_loss = float("inf")
     epochs_without_improvement = 0
 
-    for epoch in range(1, config.training.epochs + 1):
+    epochs = progress(
+        range(1, config.training.epochs + 1),
+        enabled=show_progress,
+        total=config.training.epochs,
+        desc=f"Fold {config.split.fold} block {config.split.validation_block}",
+        unit="epoch",
+        leave=False,
+    )
+    for epoch in epochs:
         train_stats = train_epoch(
             model,
             loaders.train,
@@ -271,6 +285,8 @@ def train_experiment(
             optimizer,
             config.training.gradient_clip_norm,
             config.model.classification_mode,
+            show_progress,
+            f"F{config.split.fold} B{config.split.validation_block} epoch {epoch}",
         )
         validation_stats = validate_full_segments(
             model,
@@ -278,6 +294,8 @@ def train_experiment(
             loaders.split.segments["validation"],
             device,
             config.model.classification_mode,
+            show_progress=show_progress,
+            description=f"F{config.split.fold} B{config.split.validation_block} validation",
         )
         scheduler.step(validation_stats.loss)
         record = {
@@ -287,6 +305,12 @@ def train_experiment(
             "learning_rate": optimizer.param_groups[0]["lr"],
         }
         history.append(record)
+        if hasattr(epochs, "set_postfix"):
+            epochs.set_postfix(
+                train=f"{train_stats.loss:.4f}",
+                val=f"{validation_stats.loss:.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2g}",
+            )
         with history_path.open("w", encoding="utf-8") as handle:
             json.dump(history, handle, indent=2)
 
@@ -326,6 +350,7 @@ def train_full_half_refit(
     epochs: int,
     run_dir: str | Path,
     inner_best_epochs: list[int],
+    show_progress: bool = False,
 ) -> Dict[str, object]:
     """Refit from scratch on the complete training half for a fixed epoch count."""
     if epochs < 1:
@@ -346,7 +371,15 @@ def train_full_half_refit(
     history_path = run_dir / "history.json"
     checkpoint_path = run_dir / "final_checkpoint.pt"
     history = []
-    for epoch in range(1, epochs + 1):
+    epoch_iter = progress(
+        range(1, epochs + 1),
+        enabled=show_progress,
+        total=epochs,
+        desc=f"Fold {config.split.fold} refit",
+        unit="epoch",
+        leave=False,
+    )
+    for epoch in epoch_iter:
         train_stats = train_epoch(
             model,
             loaders.train,
@@ -354,6 +387,8 @@ def train_full_half_refit(
             optimizer,
             config.training.gradient_clip_norm,
             config.model.classification_mode,
+            show_progress,
+            f"F{config.split.fold} refit epoch {epoch}",
         )
         history.append(
             {
@@ -362,6 +397,8 @@ def train_full_half_refit(
                 "learning_rate": optimizer.param_groups[0]["lr"],
             }
         )
+        if hasattr(epoch_iter, "set_postfix"):
+            epoch_iter.set_postfix(train=f"{train_stats.loss:.4f}")
         with history_path.open("w", encoding="utf-8") as handle:
             json.dump(history, handle, indent=2)
     torch.save(
@@ -386,20 +423,27 @@ def train_full_half_refit(
     }
 
 
-def run_cross_validation(config: ExperimentConfig) -> Dict[str, object]:
+def run_cross_validation(
+    config: ExperimentConfig, parent: str | Path, show_progress: bool = False
+) -> Dict[str, object]:
     """Run three inner blocks, summarize validation, then refit the complete half."""
     config.validate()
-    parent = (
-        Path(config.training.output_dir)
-        / experiment_name(config)
-    )
+    parent = Path(parent)
     block_results = []
     best_epochs = []
-    for block in (1, 2, 3):
+    blocks = progress(
+        (1, 2, 3),
+        enabled=show_progress,
+        total=3,
+        desc=f"Fold {config.split.fold} inner CV",
+        unit="block",
+        leave=False,
+    )
+    for block in blocks:
         inner_config = copy.deepcopy(config)
         inner_config.split.validation_block = block
         block_dir = parent / f"inner_block{block}"
-        training_result = train_experiment(inner_config, block_dir)
+        training_result = train_experiment(inner_config, block_dir, show_progress)
         if config.model.classification_mode == "binary":
             evaluation = evaluate_checkpoint(
                 training_result["checkpoint_path"],
@@ -410,6 +454,7 @@ def run_cross_validation(config: ExperimentConfig) -> Dict[str, object]:
                 inner_config.training.device,
                 training_mode="inner_cv",
                 validation_block=block,
+                show_progress=show_progress,
             )
         else:
             from .evaluate_had import evaluate_had_checkpoint
@@ -423,6 +468,7 @@ def run_cross_validation(config: ExperimentConfig) -> Dict[str, object]:
                 inner_config.training.device,
                 training_mode="inner_cv",
                 validation_block=block,
+                show_progress=show_progress,
             )
         evaluation_path = block_dir / "evaluation_validation.json"
         with evaluation_path.open("w", encoding="utf-8") as handle:
@@ -430,25 +476,29 @@ def run_cross_validation(config: ExperimentConfig) -> Dict[str, object]:
         best_epoch = int(training_result["best_epoch"])
         best_epochs.append(best_epoch)
         block_result = {
-                "validation_block": block,
-                "validation_interval": evaluation.report["runs"][0],
-                "best_epoch": best_epoch,
-                "best_validation_loss": training_result["best_validation_loss"],
-                "frame_macro_f1": evaluation.report["frame_metrics"]["macro_f1"],
-                "checkpoint_path": training_result["checkpoint_path"],
-            }
+            "validation_block": block,
+            "validation_interval": evaluation.report["runs"][0],
+            "best_epoch": best_epoch,
+            "best_validation_loss": training_result["best_validation_loss"],
+            "frame_macro_f1": evaluation.report["frame_metrics"]["macro_f1"],
+            "checkpoint_path": training_result["checkpoint_path"],
+        }
         if config.model.classification_mode == "binary":
             block_result["best_validation_bce"] = training_result["best_validation_loss"]
-            block_result["binary_segment_mean_f1"] = evaluation.report["segment_metrics"]["mean_f1"]
+            block_result["binary_segment_mean_f1"] = evaluation.report[
+                "segment_metrics"
+            ]["mean_f1"]
         else:
             block_result["best_validation_ce"] = training_result["best_validation_loss"]
-            block_result["possession_spell_mean_f1"] = evaluation.report["spell_metrics"]["mean_f1"]
+            block_result["possession_spell_mean_f1"] = evaluation.report[
+                "spell_metrics"
+            ]["mean_f1"]
         block_results.append(block_result)
 
     refit_epochs = int(np.median(best_epochs))
     refit_config = copy.deepcopy(config)
     refit_result = train_full_half_refit(
-        refit_config, refit_epochs, parent / "refit", best_epochs
+        refit_config, refit_epochs, parent / "refit", best_epochs, show_progress
     )
     summary = {
         "schema_version": "wcsf_temporal_cv_v2",
@@ -483,16 +533,46 @@ def run_cross_validation(config: ExperimentConfig) -> Dict[str, object]:
     return summary
 
 
+def train_run(
+    config: ExperimentConfig, folds: tuple[int, ...], show_progress: bool = True
+) -> tuple[Path, dict[str, object]]:
+    """Create one timestamped run and train every requested outer fold."""
+    run_dir, metadata = create_run_directory(config, folds)
+    summaries: dict[str, object] = {}
+    try:
+        progress_write(f"Run directory: {run_dir}", enabled=show_progress)
+        fold_iter = progress(
+            folds,
+            enabled=show_progress,
+            total=len(folds),
+            desc="Outer folds",
+            unit="fold",
+        )
+        for fold in fold_iter:
+            fold_config = copy.deepcopy(config)
+            fold_config.split.fold = fold
+            summaries[str(fold)] = run_cross_validation(
+                fold_config, fold_dir(run_dir, fold), show_progress
+            )
+            update_run_status(
+                run_dir, metadata, status="running", completed_fold=fold
+            )
+        update_run_status(run_dir, metadata, status="completed")
+    except Exception:
+        update_run_status(run_dir, metadata, status="failed")
+        raise
+    return run_dir, summaries
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
-    parser.add_argument("--fold", type=int, choices=(1, 2))
+    parser.add_argument("--fold", choices=("1", "2", "all"), default="all")
     parser.add_argument("--model-type", choices=("team_tcn", "deepsets_tcn"))
     parser.add_argument("--classification-mode", choices=("binary", "had"))
+    parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
-    if args.fold is not None:
-        config.split.fold = args.fold
     if args.model_type is not None:
         config.model.model_type = args.model_type
     if args.classification_mode is not None:
@@ -506,8 +586,14 @@ def main() -> None:
                 "data/open_data_groningen/processed/wcsf_had_labels.npz"
             )
     config.validate()
-    result = run_cross_validation(config)
-    print(json.dumps(result, indent=2))
+    folds = (1, 2) if args.fold == "all" else (int(args.fold),)
+    run_dir, summaries = train_run(config, folds, not args.no_progress)
+    print(f"Completed run: {run_dir}")
+    for fold, summary in summaries.items():
+        print(
+            f"  Fold {fold}: refit epochs={summary['refit_epochs']}, "
+            f"mean validation loss={summary['mean_best_validation_loss']:.4f}"
+        )
 
 
 if __name__ == "__main__":

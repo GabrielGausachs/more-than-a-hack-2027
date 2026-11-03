@@ -8,6 +8,7 @@ import numpy as np
 
 from modeling.alive_dead.evaluate_had import HADRun, compute_had_metrics
 from modeling.alive_dead.postprocess_had import (
+    DEFAULT_VITERBI_PENALTIES,
     Decoder,
     ProbabilityRun,
     _combined_oof_report,
@@ -16,6 +17,7 @@ from modeling.alive_dead.postprocess_had import (
     save_probability_cache,
     select_global_decoders,
     smooth_probabilities,
+    two_stage_viterbi_decode,
     viterbi_decode,
 )
 
@@ -58,6 +60,27 @@ class HADPostprocessingTests(unittest.TestCase):
         np.testing.assert_array_equal(viterbi_decode(probabilities, 0.0), [0, 1, 0])
         np.testing.assert_array_equal(viterbi_decode(probabilities, 1.0), [0, 0, 0])
 
+    def test_two_stage_viterbi_separates_alive_and_ownership_decisions(self):
+        probabilities = np.array(
+            [
+                [0.90, 0.05, 0.05],
+                [0.45, 0.50, 0.05],
+                [0.90, 0.05, 0.05],
+                [0.05, 0.05, 0.90],
+                [0.05, 0.90, 0.05],
+            ],
+            dtype=np.float32,
+        )
+        decoded = two_stage_viterbi_decode(probabilities, 0.0, 1.0)
+        np.testing.assert_array_equal(decoded, [0, 0, 0, 2, 1])
+
+        joint = np.array([[0.35, 0.25, 0.40]], dtype=np.float32)
+        self.assertEqual(int(joint.argmax(axis=1)[0]), 2)
+        self.assertEqual(int(two_stage_viterbi_decode(joint, 0.0, 0.0)[0]), 0)
+
+    def test_default_penalty_grid_includes_eight_and_ten(self):
+        self.assertEqual(DEFAULT_VITERBI_PENALTIES[-3:], (6.0, 8.0, 10.0))
+
     def test_decoding_restarts_at_disconnected_and_unknown_label_gaps(self):
         runs = (
             probability_run(0, 1, [0, 0]),
@@ -89,7 +112,10 @@ class HADPostprocessingTests(unittest.TestCase):
         )
         self.assertEqual(set(report["raw"]["blocks"]), set(blocks))
         self.assertIn("six inner-validation blocks", report["selection_scope"])
-        self.assertEqual(set(selected), {"raw", "smoothing", "viterbi", "selected"})
+        self.assertEqual(
+            set(selected),
+            {"raw", "smoothing", "viterbi", "two_stage_viterbi", "selected"},
+        )
         self.assertEqual(selected["raw"], Decoder("raw"))
 
         incomplete = dict(blocks)
@@ -125,7 +151,13 @@ class HADPostprocessingTests(unittest.TestCase):
     def test_oof_mapping_is_enforced(self):
         selections = {
             name: Decoder("raw")
-            for name in ("raw", "smoothing", "viterbi", "selected")
+            for name in (
+                "raw",
+                "smoothing",
+                "viterbi",
+                "two_stage_viterbi",
+                "selected",
+            )
         }
         outer = {
             1: (probability_run(10, 2, [0, 1, 2]),),

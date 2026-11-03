@@ -21,14 +21,19 @@ from .evaluate import evaluate_checkpoint, select_device
 from .inference import predict_segment_logits
 from .progress import progress, progress_write
 from .runs import create_run_directory, fold_dir, update_run_status
-from .splits import Segment
-from .tcn import build_model
+from .splits import Segment, valid_subsegments
+from .tcn import build_model, had_probabilities_from_logits
 
 
 @dataclass(frozen=True)
 class EpochStats:
     loss: float
     effective_frames: float
+    classification_loss: float | None = None
+    transition_loss: float | None = None
+    transition_pairs: float | None = None
+    spell_f1: float | None = None
+    macro_f1: float | None = None
     alive_loss: float | None = None
     possession_loss: float | None = None
     alive_frames: float | None = None
@@ -37,6 +42,22 @@ class EpochStats:
 
 def _stats_fields(prefix: str, stats: EpochStats) -> Dict[str, float]:
     values = {f"{prefix}_loss": stats.loss}
+    if stats.classification_loss is not None:
+        values[f"{prefix}_classification_loss"] = stats.classification_loss
+    if stats.transition_loss is not None:
+        values.update(
+            {
+                f"{prefix}_transition_loss": stats.transition_loss,
+                f"{prefix}_transition_pairs": stats.transition_pairs,
+            }
+        )
+    if stats.spell_f1 is not None:
+        values.update(
+            {
+                f"{prefix}_spell_f1": stats.spell_f1,
+                f"{prefix}_macro_f1": stats.macro_f1,
+            }
+        )
     if stats.alive_loss is not None:
         values.update(
             {
@@ -47,6 +68,24 @@ def _stats_fields(prefix: str, stats: EpochStats) -> Dict[str, float]:
             }
         )
     return values
+
+
+def checkpoint_selection_key(
+    stats: EpochStats, classification_mode: str
+) -> tuple[float, ...]:
+    """Return the deterministic checkpoint ordering for one validation epoch."""
+    if classification_mode == "binary":
+        return (-stats.loss,)
+    if classification_mode != "had":
+        raise ValueError("classification_mode must be 'binary' or 'had'")
+    if stats.spell_f1 is None or stats.macro_f1 is None:
+        raise ValueError("H/A/D checkpoint selection requires spell and macro F1")
+    classification_loss = (
+        stats.classification_loss
+        if stats.classification_loss is not None
+        else stats.loss
+    )
+    return (stats.spell_f1, stats.macro_f1, -classification_loss)
 
 
 def set_reproducible_seed(seed: int) -> None:
@@ -171,6 +210,42 @@ def hierarchical_loss_components(
     )
 
 
+def transition_loss_components(
+    logits: torch.Tensor,
+    batch: Mapping[str, torch.Tensor],
+    had_head_type: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return weighted soft transition BCE for fully contextualized adjacent pairs."""
+    required = {
+        "labels",
+        "label_valid",
+        "transition_supervision_mask",
+        "transition_loss_weight",
+    }
+    missing = required.difference(batch)
+    if missing:
+        raise ValueError(f"Transition-loss batch is missing values: {sorted(missing)}")
+    probabilities = had_probabilities_from_logits(logits, had_head_type)
+    predicted = 1.0 - (probabilities[:, :-1] * probabilities[:, 1:]).sum(dim=-1)
+    valid = (
+        batch["transition_supervision_mask"][:, 1:]
+        & batch["label_valid"][:, :-1]
+        & batch["label_valid"][:, 1:]
+    )
+    weight = valid.to(logits.dtype) * batch["transition_loss_weight"][:, 1:].to(
+        logits.dtype
+    )
+    denominator = weight.sum()
+    if denominator.item() <= 0:
+        return logits.sum() * 0.0, denominator
+    target = (batch["labels"][:, :-1] != batch["labels"][:, 1:]).to(logits.dtype)
+    epsilon = torch.finfo(predicted.dtype).eps
+    element_loss = F.binary_cross_entropy(
+        predicted.clamp(epsilon, 1.0 - epsilon), target, reduction="none"
+    )
+    return (element_loss * weight).sum(), denominator
+
+
 def train_epoch(
     model: nn.Module,
     loader: torch.utils.data.DataLoader,
@@ -180,6 +255,8 @@ def train_epoch(
     gradient_clip_norm: float | None = None,
     show_progress: bool = False,
     description: str = "Training",
+    use_transition_loss: bool = False,
+    transition_loss_weight: float = 0.1,
 ) -> EpochStats:
     """Train for one epoch using center-supervised temporal windows."""
     model.train()
@@ -189,6 +266,8 @@ def train_epoch(
     alive_denominator_total = 0.0
     possession_numerator_total = 0.0
     possession_denominator_total = 0.0
+    transition_numerator_total = 0.0
+    transition_denominator_total = 0.0
     batches = progress(
         loader,
         enabled=show_progress,
@@ -233,6 +312,16 @@ def train_epoch(
             loss = numerator / denominator
             total_numerator += float(numerator.detach().cpu())
             total_denominator += float(denominator.detach().cpu())
+        if use_transition_loss:
+            transition_num, transition_den = transition_loss_components(
+                logits, batch, model_config.had_head_type
+            )
+            if transition_den.item() > 0:
+                loss = loss + transition_loss_weight * (
+                    transition_num / transition_den
+                )
+                transition_numerator_total += float(transition_num.detach().cpu())
+                transition_denominator_total += float(transition_den.detach().cpu())
         loss.backward()
         if gradient_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
@@ -246,15 +335,35 @@ def train_epoch(
                     )
             else:
                 running = total_numerator / total_denominator
+            if transition_denominator_total > 0:
+                running += transition_loss_weight * (
+                    transition_numerator_total / transition_denominator_total
+                )
             batches.set_postfix(loss=f"{running:.4f}")
+    if use_transition_loss and transition_denominator_total <= 0:
+        raise ValueError("Epoch contains no valid adjacent transition pairs")
     if alive_denominator_total > 0:
         if possession_denominator_total <= 0:
             raise ValueError("Epoch contains no valid possession targets")
         alive_loss = alive_numerator_total / alive_denominator_total
         possession_loss = possession_numerator_total / possession_denominator_total
+        classification_loss = (
+            alive_loss + model_config.possession_loss_weight * possession_loss
+        )
+        transition_loss = (
+            transition_numerator_total / transition_denominator_total
+            if transition_denominator_total > 0
+            else None
+        )
         return EpochStats(
-            alive_loss + model_config.possession_loss_weight * possession_loss,
+            classification_loss
+            + (transition_loss_weight * transition_loss if transition_loss is not None else 0.0),
             alive_denominator_total,
+            classification_loss,
+            transition_loss,
+            transition_denominator_total if transition_loss is not None else None,
+            None,
+            None,
             alive_loss,
             possession_loss,
             alive_denominator_total,
@@ -262,7 +371,20 @@ def train_epoch(
         )
     if total_denominator <= 0:
         raise ValueError("Epoch produced no valid outputs")
-    return EpochStats(total_numerator / total_denominator, total_denominator)
+    classification_loss = total_numerator / total_denominator
+    transition_loss = (
+        transition_numerator_total / transition_denominator_total
+        if transition_denominator_total > 0
+        else None
+    )
+    return EpochStats(
+        classification_loss
+        + (transition_loss_weight * transition_loss if transition_loss is not None else 0.0),
+        total_denominator,
+        classification_loss,
+        transition_loss,
+        transition_denominator_total if transition_loss is not None else None,
+    )
 
 
 def validate_full_segments(
@@ -276,6 +398,8 @@ def validate_full_segments(
     chunk_frames: int | None = None,
     show_progress: bool = False,
     description: str = "Validation",
+    use_transition_loss: bool = False,
+    transition_loss_weight: float = 0.1,
 ) -> EpochStats:
     """Calculate mean validation loss from one prediction per valid frame."""
     total_numerator = 0.0
@@ -284,6 +408,9 @@ def validate_full_segments(
     alive_frames = 0
     possession_numerator = 0.0
     possession_frames = 0
+    transition_numerator = 0.0
+    transition_pairs = 0
+    had_runs = []
     segment_iter = progress(
         segments,
         enabled=show_progress,
@@ -310,6 +437,43 @@ def validate_full_segments(
         frame_slice = slice(segment.start, segment.end)
         valid = torch.from_numpy(data.label_valid[frame_slice]).bool()
         labels = torch.from_numpy(data.labels[frame_slice])
+        if classification_mode == "had":
+            from .evaluate_had import HADRun
+
+            probabilities = had_probabilities_from_logits(logits, had_head_type)
+            predictions = probabilities.argmax(dim=-1).to(torch.int8).cpu().numpy()
+            for valid_segment in valid_subsegments(segment, data.label_valid):
+                local_start = valid_segment.start - segment.start
+                local_end = valid_segment.end - segment.start
+                had_runs.append(
+                    HADRun(
+                        valid_segment.start,
+                        valid_segment.end,
+                        valid_segment.half_id,
+                        data.labels[valid_segment.start : valid_segment.end].copy(),
+                        predictions[local_start:local_end].copy(),
+                    )
+                )
+            if use_transition_loss and segment.length > 1:
+                pair_valid = valid[:-1] & valid[1:]
+                if pair_valid.any():
+                    predicted_transition = 1.0 - (
+                        probabilities[:-1] * probabilities[1:]
+                    ).sum(dim=-1)
+                    target_transition = (labels[:-1] != labels[1:]).to(
+                        predicted_transition.dtype
+                    )
+                    epsilon = torch.finfo(predicted_transition.dtype).eps
+                    transition_numerator += float(
+                        F.binary_cross_entropy(
+                            predicted_transition[pair_valid].clamp(
+                                epsilon, 1.0 - epsilon
+                            ),
+                            target_transition[pair_valid],
+                            reduction="sum",
+                        )
+                    )
+                    transition_pairs += int(pair_valid.sum())
         if classification_mode == "had" and had_head_type == "hierarchical":
             if data.alive_labels is None:
                 raise ValueError("Hierarchical validation targets are unavailable")
@@ -355,9 +519,22 @@ def validate_full_segments(
             raise ValueError("Validation lacks hierarchical supervision targets")
         alive_loss = alive_numerator / alive_frames
         possession_loss = possession_numerator / possession_frames
+        classification_loss = alive_loss + possession_loss_weight * possession_loss
+        transition_loss = (
+            transition_numerator / transition_pairs if transition_pairs else None
+        )
+        from .evaluate_had import compute_had_metrics
+
+        metrics = compute_had_metrics(had_runs, data.source_fps)
         return EpochStats(
-            alive_loss + possession_loss_weight * possession_loss,
+            classification_loss
+            + (transition_loss_weight * transition_loss if transition_loss is not None else 0.0),
             float(alive_frames),
+            classification_loss,
+            transition_loss,
+            float(transition_pairs) if transition_loss is not None else None,
+            metrics["spell_metrics"]["mean_f1"],
+            metrics["frame_metrics"]["macro_f1"],
             alive_loss,
             possession_loss,
             float(alive_frames),
@@ -365,7 +542,27 @@ def validate_full_segments(
         )
     if total_frames == 0:
         raise ValueError("Validation contains no valid labelled frames")
-    return EpochStats(total_numerator / total_frames, float(total_frames))
+    classification_loss = total_numerator / total_frames
+    if classification_mode == "had":
+        from .evaluate_had import compute_had_metrics
+
+        metrics = compute_had_metrics(had_runs, data.source_fps)
+        transition_loss = (
+            transition_numerator / transition_pairs if transition_pairs else None
+        )
+        return EpochStats(
+            classification_loss
+            + (transition_loss_weight * transition_loss if transition_loss is not None else 0.0),
+            float(total_frames),
+            classification_loss,
+            transition_loss,
+            float(transition_pairs) if transition_loss is not None else None,
+            metrics["spell_metrics"]["mean_f1"],
+            metrics["frame_metrics"]["macro_f1"],
+        )
+    return EpochStats(
+        classification_loss, float(total_frames), classification_loss=classification_loss
+    )
 
 
 def _checkpoint_payload(
@@ -379,6 +576,8 @@ def _checkpoint_payload(
     training_mode: str,
     validation_block: int | None,
     inner_best_epochs: list[int] | None = None,
+    best_validation_spell_f1: float | None = None,
+    best_validation_macro_f1: float | None = None,
 ) -> Dict[str, object]:
     return {
         "model_state": model.state_dict(),
@@ -395,6 +594,13 @@ def _checkpoint_payload(
         "training_mode": training_mode,
         "validation_block": validation_block,
         "inner_best_epochs": inner_best_epochs,
+        "checkpoint_selection_metric": (
+            "raw_validation_spell_f1"
+            if config.model.classification_mode == "had" and training_mode == "inner_cv"
+            else "validation_loss"
+        ),
+        "best_validation_spell_f1": best_validation_spell_f1,
+        "best_validation_macro_f1": best_validation_macro_f1,
     }
 
 
@@ -426,6 +632,11 @@ def train_experiment(
     checkpoint_path = run_dir / "best_checkpoint.pt"
     history = []
     best_validation_loss = float("inf")
+    best_validation_spell_f1 = float("-inf")
+    best_validation_macro_f1 = float("-inf")
+    best_selection_key: tuple[float, ...] | None = None
+    best_record: Dict[str, float] | None = None
+    best_epoch = 0
     epochs_without_improvement = 0
 
     epochs = progress(
@@ -446,6 +657,8 @@ def train_experiment(
             config.training.gradient_clip_norm,
             show_progress,
             f"F{config.split.fold} B{config.split.validation_block} epoch {epoch}",
+            config.training.use_transition_loss,
+            config.training.transition_loss_weight,
         )
         validation_stats = validate_full_segments(
             model,
@@ -457,8 +670,15 @@ def train_experiment(
             config.model.possession_loss_weight,
             show_progress=show_progress,
             description=f"F{config.split.fold} B{config.split.validation_block} validation",
+            use_transition_loss=config.training.use_transition_loss,
+            transition_loss_weight=config.training.transition_loss_weight,
         )
-        scheduler.step(validation_stats.loss)
+        scheduler_metric = (
+            validation_stats.classification_loss
+            if validation_stats.classification_loss is not None
+            else validation_stats.loss
+        )
+        scheduler.step(scheduler_metric)
         record = {
             "epoch": epoch,
             "learning_rate": optimizer.param_groups[0]["lr"],
@@ -475,9 +695,36 @@ def train_experiment(
         with history_path.open("w", encoding="utf-8") as handle:
             json.dump(history, handle, indent=2)
 
-        if validation_stats.loss < best_validation_loss:
+        if config.model.classification_mode == "had":
+            selection_key = checkpoint_selection_key(validation_stats, "had")
+            better_checkpoint = (
+                best_selection_key is None or selection_key > best_selection_key
+            )
+            strict_primary_improvement = (
+                validation_stats.spell_f1 > best_validation_spell_f1
+            )
+        else:
+            selection_key = checkpoint_selection_key(validation_stats, "binary")
+            better_checkpoint = (
+                best_selection_key is None or selection_key > best_selection_key
+            )
+            strict_primary_improvement = better_checkpoint
+
+        if better_checkpoint:
+            best_selection_key = selection_key
             best_validation_loss = validation_stats.loss
-            epochs_without_improvement = 0
+            best_validation_spell_f1 = (
+                validation_stats.spell_f1
+                if validation_stats.spell_f1 is not None
+                else best_validation_spell_f1
+            )
+            best_validation_macro_f1 = (
+                validation_stats.macro_f1
+                if validation_stats.macro_f1 is not None
+                else best_validation_macro_f1
+            )
+            best_record = record.copy()
+            best_epoch = epoch
             torch.save(
                 _checkpoint_payload(
                     model,
@@ -489,23 +736,45 @@ def train_experiment(
                     best_validation_loss,
                     "inner_cv",
                     config.split.validation_block,
+                    best_validation_spell_f1=(
+                        best_validation_spell_f1
+                        if config.model.classification_mode == "had"
+                        else None
+                    ),
+                    best_validation_macro_f1=(
+                        best_validation_macro_f1
+                        if config.model.classification_mode == "had"
+                        else None
+                    ),
                 ),
                 checkpoint_path,
             )
+        if strict_primary_improvement:
+            epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= config.training.early_stopping_patience:
                 break
 
+    if best_record is None or best_epoch < 1:
+        raise ValueError("Training did not select a checkpoint")
     return {
         "run_dir": str(run_dir),
         "checkpoint_path": str(checkpoint_path),
         "best_validation_loss": best_validation_loss,
-        "best_validation_stats": min(
-            history, key=lambda item: item["validation_loss"]
+        "best_validation_stats": best_record,
+        "best_validation_spell_f1": (
+            best_validation_spell_f1
+            if config.model.classification_mode == "had"
+            else None
+        ),
+        "best_validation_macro_f1": (
+            best_validation_macro_f1
+            if config.model.classification_mode == "had"
+            else None
         ),
         "epochs_completed": len(history),
-        "best_epoch": min(history, key=lambda item: item["validation_loss"])["epoch"],
+        "best_epoch": best_epoch,
     }
 
 
@@ -553,6 +822,8 @@ def train_full_half_refit(
             config.training.gradient_clip_norm,
             show_progress,
             f"F{config.split.fold} refit epoch {epoch}",
+            config.training.use_transition_loss,
+            config.training.transition_loss_weight,
         )
         history.append(
             {
@@ -646,6 +917,11 @@ def run_cross_validation(
             "best_validation_loss": training_result["best_validation_loss"],
             "frame_macro_f1": evaluation.report["frame_metrics"]["macro_f1"],
             "checkpoint_path": training_result["checkpoint_path"],
+            "checkpoint_selection_metric": (
+                "raw_validation_spell_f1"
+                if config.model.classification_mode == "had"
+                else "validation_loss"
+            ),
         }
         if config.model.classification_mode == "binary":
             block_result["best_validation_bce"] = training_result["best_validation_loss"]
@@ -653,8 +929,8 @@ def run_cross_validation(
                 "segment_metrics"
             ]["mean_f1"]
         else:
+            best_stats = training_result["best_validation_stats"]
             if config.model.had_head_type == "hierarchical":
-                best_stats = training_result["best_validation_stats"]
                 block_result.update(
                     {
                         "best_validation_alive_bce": best_stats[
@@ -667,9 +943,24 @@ def run_cross_validation(
                     }
                 )
             else:
-                block_result["best_validation_ce"] = training_result[
-                    "best_validation_loss"
+                block_result["best_validation_ce"] = best_stats[
+                    "validation_classification_loss"
                 ]
+            if config.training.use_transition_loss:
+                block_result.update(
+                    {
+                        "best_validation_transition_loss": best_stats[
+                            "validation_transition_loss"
+                        ],
+                        "transition_loss_weight": config.training.transition_loss_weight,
+                    }
+                )
+            block_result["selected_validation_spell_f1"] = training_result[
+                "best_validation_spell_f1"
+            ]
+            block_result["selected_validation_macro_f1"] = training_result[
+                "best_validation_macro_f1"
+            ]
             block_result["possession_spell_mean_f1"] = evaluation.report[
                 "spell_metrics"
             ]["mean_f1"]
@@ -681,7 +972,7 @@ def run_cross_validation(
         refit_config, refit_epochs, parent / "refit", best_epochs, show_progress
     )
     summary = {
-        "schema_version": "wcsf_temporal_cv_v2",
+        "schema_version": "wcsf_temporal_cv_v3",
         "classification_mode": config.model.classification_mode,
         "had_head_type": config.model.had_head_type,
         "fold": config.split.fold,
@@ -697,6 +988,11 @@ def run_cross_validation(
         "inner_best_epochs": best_epochs,
         "refit_epochs": refit_epochs,
         "refit_checkpoint_path": refit_result["checkpoint_path"],
+        "checkpoint_selection_metric": (
+            "raw_validation_spell_f1"
+            if config.model.classification_mode == "had"
+            else "validation_loss"
+        ),
     }
     if config.model.classification_mode == "binary":
         summary["mean_best_validation_bce"] = summary["mean_best_validation_loss"]
@@ -704,6 +1000,12 @@ def run_cross_validation(
             np.mean([item["binary_segment_mean_f1"] for item in block_results])
         )
     else:
+        summary["mean_selected_validation_spell_f1"] = float(
+            np.mean([item["selected_validation_spell_f1"] for item in block_results])
+        )
+        summary["mean_selected_validation_macro_f1"] = float(
+            np.mean([item["selected_validation_macro_f1"] for item in block_results])
+        )
         if config.model.had_head_type == "hierarchical":
             summary.update(
                 {
@@ -731,6 +1033,8 @@ def run_cross_validation(
         summary["mean_possession_spell_f1"] = float(
             np.mean([item["possession_spell_mean_f1"] for item in block_results])
         )
+        summary["use_transition_loss"] = config.training.use_transition_loss
+        summary["transition_loss_weight"] = config.training.transition_loss_weight
     parent.mkdir(parents=True, exist_ok=True)
     with (parent / "cv_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
@@ -797,10 +1101,14 @@ def main() -> None:
     run_dir, summaries = train_run(config, folds, not args.no_progress)
     print(f"Completed run: {run_dir}")
     for fold, summary in summaries.items():
-        print(
-            f"  Fold {fold}: refit epochs={summary['refit_epochs']}, "
-            f"mean validation loss={summary['mean_best_validation_loss']:.4f}"
-        )
+        if summary["classification_mode"] == "had":
+            metric = (
+                "mean selected spell F1="
+                f"{summary['mean_selected_validation_spell_f1']:.4f}"
+            )
+        else:
+            metric = f"mean validation loss={summary['mean_best_validation_loss']:.4f}"
+        print(f"  Fold {fold}: refit epochs={summary['refit_epochs']}, {metric}")
 
 
 if __name__ == "__main__":

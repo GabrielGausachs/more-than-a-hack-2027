@@ -29,9 +29,11 @@ from .tcn import build_model, had_probabilities_from_logits
 
 
 DEFAULT_SMOOTHING_WINDOWS = (3, 5, 9, 15, 21, 31, 41)
-DEFAULT_VITERBI_PENALTIES = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+DEFAULT_VITERBI_PENALTIES = (
+    0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0
+)
 CACHE_SCHEMA_VERSION = "wcsf_had_probability_cache_v1"
-EXPERIMENT_SCHEMA_VERSION = "wcsf_had_temporal_decoding_v2"
+EXPERIMENT_SCHEMA_VERSION = "wcsf_had_temporal_decoding_v3"
 
 
 @dataclass(frozen=True)
@@ -53,10 +55,11 @@ class ProbabilityRun:
 class Decoder:
     method: str
     parameter: int | float | None = None
+    secondary_parameter: float | None = None
 
     def __post_init__(self) -> None:
         if self.method == "raw":
-            if self.parameter is not None:
+            if self.parameter is not None or self.secondary_parameter is not None:
                 raise ValueError("Raw decoding has no parameter")
         elif self.method == "smoothing":
             if (
@@ -66,9 +69,25 @@ class Decoder:
                 or self.parameter % 2 == 0
             ):
                 raise ValueError("Smoothing requires a positive odd integer window")
+            if self.secondary_parameter is not None:
+                raise ValueError("Smoothing accepts only one parameter")
         elif self.method == "viterbi":
             if self.parameter is None or not np.isfinite(self.parameter) or self.parameter < 0:
                 raise ValueError("Viterbi requires a finite non-negative penalty")
+            if self.secondary_parameter is not None:
+                raise ValueError("Flat Viterbi accepts only one penalty")
+        elif self.method == "two_stage_viterbi":
+            if (
+                self.parameter is None
+                or self.secondary_parameter is None
+                or not np.isfinite(self.parameter)
+                or not np.isfinite(self.secondary_parameter)
+                or self.parameter < 0
+                or self.secondary_parameter < 0
+            ):
+                raise ValueError(
+                    "Two-stage Viterbi requires non-negative ALIVE and ownership penalties"
+                )
         else:
             raise ValueError(f"Unknown decoder method: {self.method}")
 
@@ -78,6 +97,9 @@ class Decoder:
             result["window_frames"] = self.parameter
         elif self.method == "viterbi":
             result["transition_penalty"] = self.parameter
+        elif self.method == "two_stage_viterbi":
+            result["alive_transition_penalty"] = self.parameter
+            result["ownership_transition_penalty"] = self.secondary_parameter
         return result
 
 
@@ -119,24 +141,70 @@ def smooth_probabilities(probabilities: np.ndarray, window_frames: int) -> np.nd
 
 
 def viterbi_decode(probabilities: np.ndarray, transition_penalty: float) -> np.ndarray:
-    """Decode the maximum-score path with one symmetric state-change penalty."""
-    values = _validate_probabilities(probabilities)
+    """Decode a categorical maximum-score path with one symmetric change penalty."""
+    values = np.asarray(probabilities)
+    if (
+        values.ndim != 2
+        or values.shape[1] < 2
+        or not len(values)
+        or not np.isfinite(values).all()
+        or np.any(values < 0.0)
+        or not np.allclose(values.sum(axis=1), 1.0, atol=1e-5)
+    ):
+        raise ValueError("Viterbi probabilities must be finite categorical rows")
     if not np.isfinite(transition_penalty) or transition_penalty < 0.0:
         raise ValueError("transition_penalty must be finite and non-negative")
     emissions = np.log(np.clip(values.astype(np.float64), np.finfo(np.float64).tiny, 1.0))
     scores = emissions[0].copy()
-    backpointers = np.zeros((len(values), 3), dtype=np.int8)
-    change_cost = np.full((3, 3), -float(transition_penalty), dtype=np.float64)
+    n_states = values.shape[1]
+    backpointers = np.zeros((len(values), n_states), dtype=np.int16)
+    change_cost = np.full(
+        (n_states, n_states), -float(transition_penalty), dtype=np.float64
+    )
     np.fill_diagonal(change_cost, 0.0)
     for frame in range(1, len(values)):
         candidates = scores[:, None] + change_cost
         backpointers[frame] = np.argmax(candidates, axis=0)
-        scores = candidates[backpointers[frame], np.arange(3)] + emissions[frame]
+        scores = candidates[backpointers[frame], np.arange(n_states)] + emissions[frame]
     path = np.empty(len(values), dtype=np.int8)
     path[-1] = int(np.argmax(scores))
     for frame in range(len(values) - 1, 0, -1):
         path[frame - 1] = backpointers[frame, path[frame]]
     return path
+
+
+def two_stage_viterbi_decode(
+    probabilities: np.ndarray,
+    alive_transition_penalty: float,
+    ownership_transition_penalty: float,
+) -> np.ndarray:
+    """Decode ALIVE/DEAD first, then H/A independently inside ALIVE intervals."""
+    values = _validate_probabilities(probabilities)
+    alive_probability = values[:, 0] + values[:, 1]
+    alive_dead = np.column_stack((alive_probability, values[:, 2]))
+    alive_path = viterbi_decode(alive_dead, alive_transition_penalty) == 0
+    predictions = np.full(len(values), 2, dtype=np.int8)
+    start = 0
+    while start < len(values):
+        if not alive_path[start]:
+            start += 1
+            continue
+        end = start + 1
+        while end < len(values) and alive_path[end]:
+            end += 1
+        conditional = values[start:end, :2]
+        denominator = conditional.sum(axis=1, keepdims=True)
+        conditional = np.divide(
+            conditional,
+            denominator,
+            out=np.full_like(conditional, 0.5),
+            where=denominator > np.finfo(conditional.dtype).tiny,
+        )
+        predictions[start:end] = viterbi_decode(
+            conditional, ownership_transition_penalty
+        )
+        start = end
+    return predictions
 
 
 def decode_probability_runs(
@@ -158,6 +226,12 @@ def decode_probability_runs(
             ).astype(np.int8)
         elif decoder.method == "viterbi":
             predictions = viterbi_decode(values, float(decoder.parameter))
+        elif decoder.method == "two_stage_viterbi":
+            predictions = two_stage_viterbi_decode(
+                values,
+                float(decoder.parameter),
+                float(decoder.secondary_parameter),
+            )
         decoded.append(
             HADRun(
                 run.start,
@@ -257,13 +331,22 @@ def evaluate_decoder(
 def _selection_key(result: Mapping[str, Any], method_rank: int) -> tuple[float, ...]:
     aggregate = result["aggregate"]
     decoder = result["decoder"]
-    parameter = decoder.get("window_frames", decoder.get("transition_penalty", 0.0))
+    if decoder["method"] == "two_stage_viterbi":
+        first_parameter = float(decoder["alive_transition_penalty"])
+        second_parameter = float(decoder["ownership_transition_penalty"])
+    else:
+        first_parameter = float(
+            decoder.get("window_frames", decoder.get("transition_penalty", 0.0))
+        )
+        second_parameter = 0.0
     return (
         float(aggregate["mean_spell_f1"]),
         float(aggregate["mean_frame_macro_f1"]),
         float(aggregate["mean_spell_f1_at_iou_0.5"]),
         -float(method_rank),
-        -float(parameter),
+        -(first_parameter + second_parameter),
+        -first_parameter,
+        -second_parameter,
     )
 
 
@@ -284,6 +367,11 @@ def select_global_decoders(
     raw = Decoder("raw")
     smoothers = [Decoder("smoothing", int(window)) for window in smoothing_windows]
     viterbis = [Decoder("viterbi", float(value)) for value in viterbi_penalties]
+    two_stage = [
+        Decoder("two_stage_viterbi", float(alive), float(ownership))
+        for alive in viterbi_penalties
+        for ownership in viterbi_penalties
+    ]
     raw_result = evaluate_decoder(block_runs, raw, source_fps)
     smoothing_results = [
         evaluate_decoder(block_runs, decoder, source_fps) for decoder in smoothers
@@ -291,22 +379,42 @@ def select_global_decoders(
     viterbi_results = [
         evaluate_decoder(block_runs, decoder, source_fps) for decoder in viterbis
     ]
+    two_stage_results = [
+        evaluate_decoder(block_runs, decoder, source_fps) for decoder in two_stage
+    ]
     best_smoothing_result = max(
         smoothing_results, key=lambda result: _selection_key(result, 1)
     )
     best_viterbi_result = max(
         viterbi_results, key=lambda result: _selection_key(result, 2)
     )
-    finalists = [raw_result, best_smoothing_result, best_viterbi_result]
+    best_two_stage_result = max(
+        two_stage_results, key=lambda result: _selection_key(result, 3)
+    )
+    finalists = [
+        raw_result,
+        best_smoothing_result,
+        best_viterbi_result,
+        best_two_stage_result,
+    ]
     best_overall_result = max(
         finalists,
         key=lambda result: _selection_key(
-            result, {"raw": 0, "smoothing": 1, "viterbi": 2}[result["decoder"]["method"]]
+            result,
+            {"raw": 0, "smoothing": 1, "viterbi": 2, "two_stage_viterbi": 3}[
+                result["decoder"]["method"]
+            ],
         ),
     )
 
     def from_result(result: Mapping[str, Any]) -> Decoder:
         values = result["decoder"]
+        if values["method"] == "two_stage_viterbi":
+            return Decoder(
+                "two_stage_viterbi",
+                float(values["alive_transition_penalty"]),
+                float(values["ownership_transition_penalty"]),
+            )
         parameter = values.get("window_frames", values.get("transition_penalty"))
         return Decoder(str(values["method"]), parameter)
 
@@ -314,6 +422,7 @@ def select_global_decoders(
         "raw": raw,
         "smoothing": from_result(best_smoothing_result),
         "viterbi": from_result(best_viterbi_result),
+        "two_stage_viterbi": from_result(best_two_stage_result),
         "selected": from_result(best_overall_result),
     }
     report = {
@@ -323,11 +432,12 @@ def select_global_decoders(
             "mean frame macro F1",
             "mean spell F1 at IoU 0.5",
             "weaker decoder method",
-            "smaller parameter",
+            "smaller total penalty, then smaller individual penalties",
         ],
         "raw": raw_result,
         "smoothing_candidates": smoothing_results,
         "viterbi_candidates": viterbi_results,
+        "two_stage_viterbi_candidates": two_stage_results,
         "best": {name: decoder.to_dict() for name, decoder in selected.items()},
     }
     return report, selected
@@ -640,7 +750,13 @@ def _combined_oof_report(
     } != {1}:
         raise ValueError("OOF decoding requires Fold 2 for H1 and Fold 1 for H2")
     approaches = {}
-    for approach in ("raw", "smoothing", "viterbi", "selected"):
+    for approach in (
+        "raw",
+        "smoothing",
+        "viterbi",
+        "two_stage_viterbi",
+        "selected",
+    ):
         fold_reports = {}
         combined: list[HADRun] = []
         for fold in (1, 2):
@@ -745,8 +861,20 @@ def run_experiment(
 
         save_prediction_comparison_timeline(
             {
-                name.capitalize(): _decoded_oof_runs(outer_runs, selections, name)
-                for name in ("raw", "smoothing", "viterbi", "selected")
+                {
+                    "raw": "Raw",
+                    "smoothing": "Smoothing",
+                    "viterbi": "Viterbi",
+                    "two_stage_viterbi": "Two-stage Viterbi",
+                    "selected": "Selected",
+                }[name]: _decoded_oof_runs(outer_runs, selections, name)
+                for name in (
+                    "raw",
+                    "smoothing",
+                    "viterbi",
+                    "two_stage_viterbi",
+                    "selected",
+                )
             },
             source_fps,
             experiment_dir / "oof_timeline.png",

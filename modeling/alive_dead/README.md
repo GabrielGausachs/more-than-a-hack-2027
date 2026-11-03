@@ -88,9 +88,11 @@ overlap, and configuration validation rejects strides that would leave supervisi
 
 Validation does not use temporal windows. Each contiguous validation segment is inferred once as
 a complete sequence, UNKNOWN labels are excluded, and BCE/CE is averaged over all valid frames.
-This full-segment loss drives scheduling, checkpoint selection and early stopping. Evaluation uses
-the same shared segment-inference function; optional halo chunking is available for constrained
-memory without changing logits.
+For H/A/D, raw full-segment spell F1 drives checkpoint selection and early stopping, with frame
+macro F1 and classification loss as tie-breaks. The learning-rate scheduler retains the smoother
+classification loss. Binary training remains loss-selected. Evaluation uses the same shared
+segment-inference function; optional halo chunking is available for constrained memory without
+changing logits.
 
 ## Normalization
 
@@ -115,6 +117,10 @@ Configuration D with the ball-conditioned H/A/D frontend is provided at
 ```powershell
 python -m modeling.alive_dead.train --config configs/alive_dead/temporal_d_rf125_seq20_ball_conditioned.json --fold all
 ```
+
+The corresponding transition-regularized configuration is
+`configs/alive_dead/temporal_d_rf125_seq20_ball_conditioned_transition.json`. It adds a configurable
+plain mean adjacent-frame transition BCE at weight `0.1`; frame CE and center supervision remain.
 
 ## Models
 
@@ -166,8 +172,9 @@ python -m modeling.alive_dead.train --config path/to/config.json
 ```
 
 One command runs all three inner blocks and then the full-half refit. Inner runs use AdamW,
-masked BCE or cross-entropy, ReduceLROnPlateau, gradient clipping and full-segment validation-loss
-early stopping.
+masked BCE or cross-entropy, optional transition regularization, ReduceLROnPlateau, gradient
+clipping and full-segment validation. H/A/D checkpoints are selected by raw spell F1; binary
+checkpoints remain selected by validation loss.
 Their median best epoch becomes the fixed refit length. The refit starts from new weights, uses
 the complete training half, constant configured learning rate and no validation-dependent
 scheduler. Training constructs no test DataLoader and never performs outer-test inference.
@@ -362,12 +369,16 @@ python -m modeling.alive_dead.postprocess_had --run-dir <completed-had-run-folde
 
 The command evaluates every smoothing window and Viterbi transition penalty equally across all
 six inner-validation blocks. It selects one global decoder using mean spell F1, applies that same
-frozen decoder to both refit models' held-out halves, and compares raw argmax, smoothing, Viterbi
-and the globally selected decoder in combined OOF results.
+frozen decoder to both refit models' held-out halves, and compares raw argmax, smoothing, flat
+Viterbi, two-stage Viterbi and the globally selected decoder in combined OOF results.
 
 With `--save-timeline`, ordinary H/A/D evaluation saves `evaluation/oof_timeline.png` (or a
 fold-specific equivalent). Postprocessing saves `oof_timeline.png` in its timestamped experiment
-directory with aligned Ground truth, Raw, Smoothing, Viterbi and Selected bands.
+directory with aligned Ground truth, Raw, Smoothing, both Viterbi variants and Selected bands.
+
+Two-stage Viterbi first decodes ALIVE/DEAD from `[p(H)+p(A), p(D)]`, then decodes conditional H/A
+inside each predicted ALIVE interval with a separate penalty. Both penalty grids include `8` and
+`10`, and decoding always restarts at a permitted temporal boundary.
 
 Decoding restarts at halftime, partition boundaries and invalid-label gaps. The checkpoint-bound
 probability cache is stored at `postprocessing/probabilities.npz`; timestamped experiment reports

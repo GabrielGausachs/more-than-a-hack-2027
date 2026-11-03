@@ -85,6 +85,12 @@ def build_run_metadata(
             "normalization": "fit on training frames only; saved with each checkpoint",
             "validation_inference": "one prediction per frame from contiguous segments",
             "refit": "complete outer training half for median inner best epoch",
+            "checkpoint_selection": (
+                "raw full-segment validation spell F1; macro F1 and classification "
+                "loss tie-breaks"
+                if config.model.classification_mode == "had"
+                else "full-segment validation loss"
+            ),
             "output_head": (
                 "shared ALIVE head plus conditional H/A possession head"
                 if config.model.had_head_type == "hierarchical"
@@ -96,6 +102,12 @@ def build_run_metadata(
                 else "binary BCE or direct H/A/D cross-entropy"
             ),
             "possession_loss_weight": config.model.possession_loss_weight,
+            "transition_loss": (
+                "plain mean adjacent-frame soft transition BCE"
+                if config.training.use_transition_loss
+                else None
+            ),
+            "transition_loss_weight": config.training.transition_loss_weight,
             "had_probability_factorization": (
                 "p(H/A)=p(ALIVE)*p(H/A|ALIVE); p(D)=1-p(ALIVE)"
                 if config.model.had_head_type == "hierarchical"

@@ -31,9 +31,12 @@ from modeling.alive_dead.preprocessing import FeatureNormalizer
 from modeling.alive_dead.splits import Segment, build_fold_split, build_refit_split
 from modeling.alive_dead.tcn import build_model, had_probabilities_from_logits
 from modeling.alive_dead.train import (
+    EpochStats,
+    checkpoint_selection_key,
     hierarchical_loss_components,
     masked_bce_components,
     masked_cross_entropy_components,
+    transition_loss_components,
     validate_full_segments,
 )
 from modeling.alive_dead.train import run_cross_validation
@@ -155,6 +158,28 @@ class DatasetAndNormalizationTests(unittest.TestCase):
         np.testing.assert_allclose(weighted_coverage[segment.start : segment.end], 1.0)
         self.assertFalse(raw_coverage[: segment.start].any())
         self.assertFalse(raw_coverage[segment.end :].any())
+
+    def test_transition_pairs_have_complete_inverse_coverage(self):
+        data = synthetic_data(80)
+        segment = Segment(5, 75, "train", 1)
+        dataset = TemporalWindowDataset(
+            data,
+            (segment,),
+            sequence_frames=20,
+            stride_frames=5,
+            context_radius=6,
+            require_transition_coverage=True,
+        )
+        weighted = np.zeros(data.n_frames, dtype=np.float32)
+        for window, item in zip(dataset.windows, dataset):
+            selected = np.flatnonzero(item["transition_supervision_mask"].numpy())
+            weighted[window.start + selected] += item[
+                "transition_loss_weight"
+            ].numpy()[selected]
+        self.assertEqual(weighted[segment.start], 0.0)
+        np.testing.assert_allclose(weighted[segment.start + 1 : segment.end], 1.0)
+        self.assertFalse(weighted[: segment.start].any())
+        self.assertFalse(weighted[segment.end :].any())
 
     def test_invalid_label_is_context_but_not_supervision(self):
         data = synthetic_data(8)
@@ -513,6 +538,76 @@ class ModelTests(unittest.TestCase):
         )
         (numerator / denominator).backward()
         self.assertEqual(float(binary_logits.grad[0, 1]), 0.0)
+
+    def test_transition_loss_uses_joint_probabilities_and_valid_pairs(self):
+        direct_logits = torch.tensor(
+            [[[5.0, -5.0, -5.0], [5.0, -5.0, -5.0], [-5.0, 5.0, -5.0]]],
+            requires_grad=True,
+        )
+        batch = {
+            "labels": torch.tensor([[0.0, 0.0, 1.0]]),
+            "label_valid": torch.tensor([[True, True, True]]),
+            "transition_supervision_mask": torch.tensor([[False, True, True]]),
+            "transition_loss_weight": torch.ones((1, 3)),
+        }
+        numerator, denominator = transition_loss_components(
+            direct_logits, batch, "direct"
+        )
+        probabilities = torch.softmax(direct_logits, dim=-1)
+        predicted = 1.0 - (probabilities[:, :-1] * probabilities[:, 1:]).sum(-1)
+        expected = torch.nn.functional.binary_cross_entropy(
+            predicted, torch.tensor([[0.0, 1.0]]), reduction="sum"
+        )
+        torch.testing.assert_close(numerator, expected)
+        self.assertEqual(float(denominator), 2.0)
+        (numerator / denominator).backward()
+        self.assertTrue(torch.isfinite(direct_logits.grad).all())
+
+        invalid = {key: value.clone() for key, value in batch.items()}
+        invalid["label_valid"][0, 1] = False
+        _, invalid_denominator = transition_loss_components(
+            direct_logits.detach(), invalid, "direct"
+        )
+        self.assertEqual(float(invalid_denominator), 0.0)
+
+        hierarchical_logits = torch.zeros((1, 3, 3), requires_grad=True)
+        hierarchical_num, hierarchical_den = transition_loss_components(
+            hierarchical_logits, batch, "hierarchical"
+        )
+        (hierarchical_num / hierarchical_den).backward()
+        self.assertTrue(torch.isfinite(hierarchical_logits.grad).all())
+
+    def test_transition_configuration_requires_overlapping_centers(self):
+        config = ExperimentConfig()
+        config.model.classification_mode = "had"
+        config.training.use_transition_loss = True
+        config.data.sequence_seconds = 20.0
+        config.model.dilations = (1, 2, 4, 8, 16)
+        config.data.train_stride_seconds = 7.6
+        with self.assertRaisesRegex(ValueError, "adjacent pair"):
+            config.validate(10.0)
+
+    def test_spell_checkpoint_selection_precedes_macro_f1_and_loss(self):
+        base = EpochStats(0.8, 10, 0.7, spell_f1=0.5, macro_f1=0.8)
+        higher_spell = EpochStats(0.9, 10, 0.8, spell_f1=0.51, macro_f1=0.1)
+        higher_macro = EpochStats(0.9, 10, 0.8, spell_f1=0.5, macro_f1=0.81)
+        lower_loss = EpochStats(0.7, 10, 0.6, spell_f1=0.5, macro_f1=0.8)
+        self.assertGreater(
+            checkpoint_selection_key(higher_spell, "had"),
+            checkpoint_selection_key(base, "had"),
+        )
+        self.assertGreater(
+            checkpoint_selection_key(higher_macro, "had"),
+            checkpoint_selection_key(base, "had"),
+        )
+        self.assertGreater(
+            checkpoint_selection_key(lower_loss, "had"),
+            checkpoint_selection_key(base, "had"),
+        )
+        self.assertGreater(
+            checkpoint_selection_key(EpochStats(0.7, 10), "binary"),
+            checkpoint_selection_key(EpochStats(0.8, 10), "binary"),
+        )
 
     def test_default_receptive_field_and_unsafe_configuration(self):
         config = ExperimentConfig()

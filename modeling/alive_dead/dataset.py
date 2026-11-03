@@ -296,6 +296,7 @@ class TemporalWindowDataset(Dataset):
         sequence_frames: int,
         stride_frames: int,
         context_radius: int,
+        require_transition_coverage: bool = False,
     ) -> None:
         if sequence_frames < 1 or stride_frames < 1 or stride_frames > sequence_frames:
             raise ValueError("Require 1 <= stride_frames <= sequence_frames")
@@ -308,6 +309,7 @@ class TemporalWindowDataset(Dataset):
             raise ValueError("stride_frames cannot exceed the supervised central width")
         self.windows = []
         coverage = np.zeros(data.n_frames, dtype=np.int32)
+        transition_coverage = np.zeros(data.n_frames, dtype=np.int32)
         segments = tuple(segments)
         for segment in segments:
             if segment.start < 0 or segment.end > data.n_frames or segment.start >= segment.end:
@@ -339,12 +341,26 @@ class TemporalWindowDataset(Dataset):
                 coverage[
                     start + supervision_start : start + supervision_end
                 ] += 1
+                transition_coverage[
+                    start + supervision_start + 1 : start + supervision_end
+                ] += 1
         expected = np.zeros(data.n_frames, dtype=bool)
         for segment in segments:
             expected[segment.start : segment.end] = True
         if np.any(coverage[expected] == 0) or np.any(coverage[~expected] != 0):
             raise ValueError("Window construction does not exactly cover the supplied segments")
+        expected_pairs = np.zeros(data.n_frames, dtype=bool)
+        for segment in segments:
+            expected_pairs[segment.start + 1 : segment.end] = True
+        if require_transition_coverage and (
+            np.any(transition_coverage[expected_pairs] == 0)
+            or np.any(transition_coverage[~expected_pairs] != 0)
+        ):
+            raise ValueError(
+                "Window construction does not cover every adjacent transition pair"
+            )
         self.coverage = coverage
+        self.transition_coverage = transition_coverage
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -372,6 +388,15 @@ class TemporalWindowDataset(Dataset):
         loss_weight[window.supervision_start : window.supervision_end] = (
             1.0 / self.coverage[supervised_global]
         )
+        transition_supervision_mask = np.zeros(self.sequence_frames, dtype=bool)
+        transition_loss_weight = np.zeros(self.sequence_frames, dtype=np.float32)
+        pair_start = window.supervision_start + 1
+        pair_end = window.supervision_end
+        transition_supervision_mask[pair_start:pair_end] = True
+        pair_global = slice(window.start + pair_start, window.start + pair_end)
+        transition_loss_weight[pair_start:pair_end] = (
+            1.0 / self.transition_coverage[pair_global]
+        )
         batch = {
             "players": torch.from_numpy(self._padded(self.data.players, window)),
             "player_location_valid": torch.from_numpy(
@@ -393,6 +418,10 @@ class TemporalWindowDataset(Dataset):
             "output_mask": torch.from_numpy(output_mask),
             "supervision_mask": torch.from_numpy(supervision_mask),
             "loss_weight": torch.from_numpy(loss_weight),
+            "transition_supervision_mask": torch.from_numpy(
+                transition_supervision_mask
+            ),
+            "transition_loss_weight": torch.from_numpy(transition_loss_weight),
         }
         if self.data.ball is not None:
             batch.update(
@@ -519,6 +548,7 @@ def build_dataloaders(
         sequence_frames,
         train_stride,
         config.model.context_radius_frames,
+        require_transition_coverage=config.training.use_transition_loss,
     )
     generator = torch.Generator().manual_seed(config.training.seed)
     common = {

@@ -77,6 +77,8 @@ class TrainingConfig:
     early_stopping_patience: int = 8
     scheduler_patience: int = 3
     scheduler_factor: float = 0.5
+    use_transition_loss: bool = False
+    transition_loss_weight: float = 0.1
     device: str = "auto"
     output_dir: str = "data/open_data_groningen/model_runs"
 
@@ -138,6 +140,18 @@ class ExperimentConfig:
             raise ValueError("All TCN dilations must be positive")
         if not 0.0 <= self.model.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
+        if not isinstance(self.training.use_transition_loss, bool):
+            raise ValueError("use_transition_loss must be Boolean")
+        if (
+            not math.isfinite(self.training.transition_loss_weight)
+            or self.training.transition_loss_weight < 0.0
+        ):
+            raise ValueError("transition_loss_weight must be finite and non-negative")
+        if self.training.use_transition_loss:
+            if self.model.classification_mode != "had":
+                raise ValueError("Transition loss is currently supported only for H/A/D")
+            if self.training.transition_loss_weight <= 0.0:
+                raise ValueError("Enabled transition loss requires a positive weight")
 
         sequence_frames = self.seconds_to_frames(self.data.sequence_seconds, source_fps)
         train_stride = self.seconds_to_frames(self.data.train_stride_seconds, source_fps)
@@ -162,6 +176,11 @@ class ExperimentConfig:
             raise ValueError(
                 f"Training stride ({train_stride}) exceeds the fully contextualized "
                 f"central width ({central_width})"
+            )
+        if self.training.use_transition_loss and train_stride >= central_width:
+            raise ValueError(
+                "Transition loss requires training stride smaller than the fully "
+                "contextualized central width so every adjacent pair is covered"
             )
 
     @staticmethod

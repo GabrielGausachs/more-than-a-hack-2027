@@ -1,0 +1,39 @@
+{
+  "data": {
+    "feature_path": "data/open_data_groningen/processed/wcsf_player_team_ball_features.npz",
+    "label_path": "data/open_data_groningen/processed/wcsf_had_labels.npz",
+    "sequence_seconds": 20.0,
+    "train_stride_seconds": 5.0,
+    "num_workers": 0
+  },
+  "split": {
+    "buffer_seconds": 15.0
+  },
+  "model": {
+    "model_type": "deepsets_tcn",
+    "classification_mode": "had",
+    "use_ball": true,
+    "player_encoder_type": "ball_conditioned",
+    "kernel_size": 3,
+    "dilations": [1, 2, 4, 8, 16],
+    "convolutions_per_block": 2
+  },
+  "training": {
+    "seed": 42,
+    "use_transition_loss": false
+  },
+  "augmentation": {
+    "enabled": true,
+    "reference_feature_path": "data/metrica/processed/metrica_player_team_ball_features.npz",
+    "severity_factors": [0.5, 1.0, 1.5],
+    "probabilities": {
+      "clean": 0.4,
+      "iid_ball_dropout": 0.1,
+      "contiguous_ball_gaps": 0.1,
+      "player_observation_dropout": 0.15,
+      "player_speed_masking": 0.1,
+      "ball_speed_masking": 0.05,
+      "combined": 0.1
+    }
+  }
+}

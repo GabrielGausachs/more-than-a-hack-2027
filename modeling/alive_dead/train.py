@@ -648,6 +648,7 @@ def train_experiment(
         leave=False,
     )
     for epoch in epochs:
+        loaders.train.dataset.set_epoch(epoch)
         train_stats = train_epoch(
             model,
             loaders.train,
@@ -813,6 +814,7 @@ def train_full_half_refit(
         leave=False,
     )
     for epoch in epoch_iter:
+        loaders.train.dataset.set_epoch(epoch)
         train_stats = train_epoch(
             model,
             loaders.train,

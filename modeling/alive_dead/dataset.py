@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Callable, Dict, Sequence
 
 import numpy as np
 import torch
@@ -297,11 +297,14 @@ class TemporalWindowDataset(Dataset):
         stride_frames: int,
         context_radius: int,
         require_transition_coverage: bool = False,
+        window_transform: Callable[[WCSFData, Window, int, int], Dict[str, np.ndarray]]
+        | None = None,
     ) -> None:
         if sequence_frames < 1 or stride_frames < 1 or stride_frames > sequence_frames:
             raise ValueError("Require 1 <= stride_frames <= sequence_frames")
         self.data = data
         self.sequence_frames = sequence_frames
+        self.window_transform = window_transform
         central_width = sequence_frames - 2 * context_radius
         if context_radius < 0 or central_width < 1:
             raise ValueError("Context radius leaves no supervised center")
@@ -365,6 +368,14 @@ class TemporalWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self.windows)
 
+    def set_epoch(self, epoch: int) -> None:
+        """Set the deterministic augmentation epoch, when a transform is active."""
+        if self.window_transform is not None:
+            setter = getattr(self.window_transform, "set_epoch", None)
+            if setter is None:
+                raise TypeError("window_transform does not implement set_epoch")
+            setter(epoch)
+
     def _padded(self, array: np.ndarray, window: Window, fill_value: float | int = 0) -> np.ndarray:
         output = np.full(
             (self.sequence_frames, *array.shape[1:]), fill_value, dtype=array.dtype
@@ -376,6 +387,17 @@ class TemporalWindowDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         window = self.windows[index]
+        transformed = (
+            self.window_transform(self.data, window, index, self.sequence_frames)
+            if self.window_transform is not None
+            else None
+        )
+
+        def feature(name: str) -> np.ndarray:
+            if transformed is not None:
+                return transformed[name]
+            return self._padded(getattr(self.data, name), window)
+
         output_mask = np.zeros(self.sequence_frames, dtype=bool)
         output_mask[: window.valid_length] = True
         supervision_mask = np.zeros(self.sequence_frames, dtype=bool)
@@ -398,17 +420,11 @@ class TemporalWindowDataset(Dataset):
             1.0 / self.transition_coverage[pair_global]
         )
         batch = {
-            "players": torch.from_numpy(self._padded(self.data.players, window)),
-            "player_location_valid": torch.from_numpy(
-                self._padded(self.data.player_location_valid, window)
-            ),
-            "player_speed_valid": torch.from_numpy(
-                self._padded(self.data.player_speed_valid, window)
-            ),
-            "team_features": torch.from_numpy(self._padded(self.data.team_features, window)),
-            "team_feature_valid": torch.from_numpy(
-                self._padded(self.data.team_feature_valid, window)
-            ),
+            "players": torch.from_numpy(feature("players")),
+            "player_location_valid": torch.from_numpy(feature("player_location_valid")),
+            "player_speed_valid": torch.from_numpy(feature("player_speed_valid")),
+            "team_features": torch.from_numpy(feature("team_features")),
+            "team_feature_valid": torch.from_numpy(feature("team_feature_valid")),
             "labels": torch.from_numpy(
                 self._padded(self.data.labels, window, fill_value=-1).astype(np.float32)
             ),
@@ -426,13 +442,9 @@ class TemporalWindowDataset(Dataset):
         if self.data.ball is not None:
             batch.update(
                 {
-                    "ball": torch.from_numpy(self._padded(self.data.ball, window)),
-                    "ball_location_valid": torch.from_numpy(
-                        self._padded(self.data.ball_location_valid, window)
-                    ),
-                    "ball_speed_valid": torch.from_numpy(
-                        self._padded(self.data.ball_speed_valid, window)
-                    ),
+                    "ball": torch.from_numpy(feature("ball")),
+                    "ball_location_valid": torch.from_numpy(feature("ball_location_valid")),
+                    "ball_speed_valid": torch.from_numpy(feature("ball_speed_valid")),
                 }
             )
         if self.data.alive_labels is not None:
@@ -542,13 +554,23 @@ def build_dataloaders(
     data = normalize_wcsf_data(raw, normalizer)
     sequence_frames = config.seconds_to_frames(config.data.sequence_seconds, raw.source_fps)
     train_stride = config.seconds_to_frames(config.data.train_stride_seconds, raw.source_fps)
+    window_transform = None
+    train_data = data
+    if config.augmentation.enabled:
+        from .augmentation import MaskAugmentedWindowTransform
+
+        window_transform = MaskAugmentedWindowTransform.create(
+            config, normalizer, full_half_refit=full_half_refit
+        )
+        train_data = raw
     train_dataset = TemporalWindowDataset(
-        data,
+        train_data,
         split.segments["train"],
         sequence_frames,
         train_stride,
         config.model.context_radius_frames,
         require_transition_coverage=config.training.use_transition_loss,
+        window_transform=window_transform,
     )
     generator = torch.Generator().manual_seed(config.training.seed)
     common = {

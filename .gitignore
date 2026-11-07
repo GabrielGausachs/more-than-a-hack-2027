@@ -25,6 +25,9 @@ evaluation/results/*.csv
 !evaluation/results/baseline_*.csv
 evaluation/reports/
 evaluation/scoreboard.csv
+evaluation/metrica_had_runs/
+evaluation/wcsf_robustness_runs/
+evaluation/mask_augmented_pipeline_runs/
 
 # -- gated data --------------------------------------------------------------------------------
 # data/ is committed empty, with only its README, so the folder participants are told to unpack

@@ -1,0 +1,17 @@
+{
+  "schema_version": "wcsf_mask_augmented_pipeline_v1",
+  "baseline_robustness_config": "configs/alive_dead/wcsf_robustness.json",
+  "output_root": "evaluation/mask_augmented_pipeline_runs",
+  "training_runs": [
+    {
+      "family": "without_transition_loss",
+      "name": "without_transition_loss_mask_augmented",
+      "config": "configs/alive_dead/temporal_d_rf125_seq20_ball_conditioned_mask_augmented.json"
+    },
+    {
+      "family": "with_transition_loss_0_1",
+      "name": "with_transition_loss_0_1_mask_augmented",
+      "config": "configs/alive_dead/temporal_d_rf125_seq20_ball_conditioned_transition_0_1_mask_augmented.json"
+    }
+  ]
+}

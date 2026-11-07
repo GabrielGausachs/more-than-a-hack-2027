@@ -84,11 +84,30 @@ class TrainingConfig:
 
 
 @dataclass
+class MaskAugmentationConfig:
+    enabled: bool = False
+    reference_feature_path: str = "data/metrica/processed/metrica_player_team_ball_features.npz"
+    severity_factors: Tuple[float, ...] = (0.5, 1.0, 1.5)
+    probabilities: Dict[str, float] = field(
+        default_factory=lambda: {
+            "clean": 0.40,
+            "iid_ball_dropout": 0.10,
+            "contiguous_ball_gaps": 0.10,
+            "player_observation_dropout": 0.15,
+            "player_speed_masking": 0.10,
+            "ball_speed_masking": 0.05,
+            "combined": 0.10,
+        }
+    )
+
+
+@dataclass
 class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    augmentation: MaskAugmentationConfig = field(default_factory=MaskAugmentationConfig)
 
     def validate(
         self, source_fps: float = 10.0, require_supervised_coverage: bool = True
@@ -152,6 +171,39 @@ class ExperimentConfig:
                 raise ValueError("Transition loss is currently supported only for H/A/D")
             if self.training.transition_loss_weight <= 0.0:
                 raise ValueError("Enabled transition loss requires a positive weight")
+        if not isinstance(self.augmentation.enabled, bool):
+            raise ValueError("augmentation.enabled must be Boolean")
+        if self.augmentation.enabled:
+            expected = {
+                "clean", "iid_ball_dropout", "contiguous_ball_gaps",
+                "player_observation_dropout", "player_speed_masking",
+                "ball_speed_masking", "combined",
+            }
+            if set(self.augmentation.probabilities) != expected:
+                raise ValueError(
+                    "augmentation.probabilities must define clean, five isolated "
+                    "corruptions, and combined"
+                )
+            probabilities = tuple(self.augmentation.probabilities.values())
+            if any(not math.isfinite(value) or value < 0.0 for value in probabilities):
+                raise ValueError("augmentation probabilities must be finite and non-negative")
+            if not math.isclose(sum(probabilities), 1.0, rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError("augmentation probabilities must sum to one")
+            if (
+                not self.augmentation.severity_factors
+                or any(
+                    not math.isfinite(value) or value <= 0.0
+                    for value in self.augmentation.severity_factors
+                )
+            ):
+                raise ValueError("augmentation severity factors must be positive and finite")
+            normalized_reference = self.augmentation.reference_feature_path.replace("\\", "/").lower()
+            if "possession_gt" in normalized_reference or "/evaluation/gt/" in f"/{normalized_reference}":
+                raise ValueError("Mask augmentation cannot use competition ground truth")
+            if not self.model.use_ball or self.model.player_encoder_type != "ball_conditioned":
+                raise ValueError("Mask augmentation requires a ball-conditioned model")
+            if self.data.num_workers != 0:
+                raise ValueError("Deterministic mask augmentation requires data.num_workers=0")
 
         sequence_frames = self.seconds_to_frames(self.data.sequence_seconds, source_fps)
         train_stride = self.seconds_to_frames(self.data.train_stride_seconds, source_fps)
@@ -166,21 +218,21 @@ class ExperimentConfig:
                 f"TCN receptive field ({receptive_field}) exceeds sequence length "
                 f"({sequence_frames})"
             )
+        central_width = sequence_frames - 2 * self.model.context_radius_frames
+        if self.training.use_transition_loss and train_stride >= central_width:
+            raise ValueError(
+                "Transition loss requires training stride smaller than the fully "
+                "contextualized central width so every adjacent pair is covered"
+            )
         if receptive_field > buffer_frames:
             raise ValueError(
                 f"TCN receptive field ({receptive_field}) exceeds validation buffer "
                 f"({buffer_frames})"
             )
-        central_width = sequence_frames - 2 * self.model.context_radius_frames
         if require_supervised_coverage and train_stride > central_width:
             raise ValueError(
                 f"Training stride ({train_stride}) exceeds the fully contextualized "
                 f"central width ({central_width})"
-            )
-        if self.training.use_transition_loss and train_stride >= central_width:
-            raise ValueError(
-                "Transition loss requires training stride smaller than the fully "
-                "contextualized central width so every adjacent pair is covered"
             )
 
     @staticmethod
@@ -200,11 +252,17 @@ class ExperimentConfig:
         model_values = dict(values.get("model", {}))
         if "dilations" in model_values:
             model_values["dilations"] = tuple(model_values["dilations"])
+        augmentation_values = dict(values.get("augmentation", {}))
+        if "severity_factors" in augmentation_values:
+            augmentation_values["severity_factors"] = tuple(
+                augmentation_values["severity_factors"]
+            )
         return cls(
             data=DataConfig(**data_values),
             split=SplitConfig(**values.get("split", {})),
             model=ModelConfig(**model_values),
             training=TrainingConfig(**values.get("training", {})),
+            augmentation=MaskAugmentationConfig(**augmentation_values),
         )
 
     @classmethod

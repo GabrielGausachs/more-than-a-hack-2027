@@ -1,8 +1,8 @@
 # WCSF ALIVE/DEAD modeling
 
-This package is the training foundation for a binary temporal classifier trained on the external
-WCSF Groningen match. It does not use Metrica possession ground truth and does not implement the
-final challenge evaluation or H/A ownership model.
+This package trains temporal binary and H/A/D classifiers on the external WCSF Groningen match
+and transfers frozen checkpoints to Metrica. Metrica possession ground truth is used only by the
+final public-window evaluation, never for training or model/decoder selection.
 
 ## Package responsibilities
 
@@ -13,10 +13,20 @@ final challenge evaluation or H/A ownership model.
 - `player_encoder.py` implements the permutation-invariant player-set encoder.
 - `tcn.py` contains the shared noncausal residual TCN and both model frontends.
 - `train.py` runs the three inner trainings, validation summaries and full-half refit.
+- `metrica_had.py` runs full-match H/A/D transfer, submission generation and official evaluation.
 
-PyTorch is required but is intentionally not installed by this package. Install a build appropriate
-for the target CPU/CUDA environment, then install the remaining modeling dependencies with
-`pip install -r requirements-modeling.txt`.
+Install the modeling dependencies with `pip install -r requirements-modeling.txt`. For GPU use,
+install the appropriate PyTorch CUDA build for the target machine first; the requirements file
+otherwise installs the default supported build.
+
+If a machine mixes user-site and Conda packages, use an isolated environment and disable user-site
+shadowing when running commands. On PowerShell:
+
+```powershell
+$env:PYTHONNOUSERSITE = "1"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-modeling.txt
+```
 
 ## Inputs
 
@@ -385,3 +395,70 @@ probability cache is stored at `postprocessing/probabilities.npz`; timestamped e
 are stored under `postprocessing/decoding_<datetime>/`. Existing checkpoints and evaluation
 reports are not modified. Use `--rebuild-cache` only when the probabilities should be inferred
 again.
+
+### Frozen WCSF robustness audit
+
+The robustness workflow compares the unlabeled Metrica and WCSF feature archives,
+then stress-tests the two selected frozen H/A/D runs on synthetically degraded WCSF
+features. It never reads Metrica competition labels and never refits normalization,
+models, or decoders.
+
+```powershell
+python -m modeling.alive_dead.robustness audit `
+  --config configs/alive_dead/wcsf_robustness.json
+
+python -m modeling.alive_dead.robustness run `
+  --config configs/alive_dead/wcsf_robustness.json `
+  --device auto
+```
+
+The full run evaluates clean data and five isolated corruption families at three
+severities over ten seeds. Timestamped reports are written below
+`evaluation/wcsf_robustness_runs/` and are ignored by git.
+
+### Sequential mask-augmented training
+
+The mask-augmented pipeline first reproduces the frozen robustness baseline, then
+trains no-transition and transition-loss-0.1 counterparts sequentially. Training
+windows receive deterministic raw-feature masking before the unchanged clean-fold
+normalizer; validation, test data, labels, supervision boundaries, and decoder
+selection remain clean. Metrica supplies only feature missingness and gap statistics.
+
+```powershell
+python -m modeling.alive_dead.mask_augmented_pipeline `
+  --config configs/alive_dead/mask_augmented_pipeline.json `
+  --device auto
+```
+
+Each augmented run performs the existing three-block inner CV and full-half refit for
+both outer folds, clean OOF evaluation, and leakage-safe global decoder selection. The
+same scenarios, severities, seeds, and metrics are then evaluated for the augmented
+models. Pipeline manifests and paired clean/degraded comparisons are stored below
+`evaluation/mask_augmented_pipeline_runs/`; model checkpoints remain in the configured
+model-run directory. Resume an interrupted pipeline with
+`--resume evaluation/mask_augmented_pipeline_runs/<timestamp>`. An interrupted model
+training stage starts a new run directory; verified completed stages are reused.
+
+### Full Metrica H/A/D comparison
+
+The frozen best models with and without transition loss can be transferred together with:
+
+```powershell
+python -m modeling.alive_dead.metrica_had `
+  --config configs/alive_dead/metrica_best_models.json `
+  --features data/metrica/processed/metrica_player_team_ball_features.npz `
+  --ground-truth evaluation/gt/BAR-ATH_possession_gt_public.csv `
+  --device auto `
+  --bootstrap 1000
+```
+
+Each run's two refit checkpoints independently predict both complete Metrica halves. Their H/A/D
+probabilities are averaged 50/50, then compared as raw argmax and with the globally selected WCSF
+decoder. Decoding happens independently per half at 10 Hz before labels are mapped back to the
+25 Hz video timeline. The command creates four complete 199,319-row submissions and verifies its
+reports against the official scorer.
+
+Generated submissions, probability archives, reports, input hashes and the official scoreboard
+are stored under `evaluation/metrica_had_runs/<timestamp>/`, which is intentionally gitignored.
+The public ground truth covers only 7,500 frames and 17 possessions; it is used for final pipeline
+diagnostics only, never decoder, checkpoint or ensemble selection.

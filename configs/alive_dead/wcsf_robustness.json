@@ -1,0 +1,28 @@
+{
+  "schema_version": "wcsf_had_robustness_v1",
+  "wcsf_features": "data/open_data_groningen/processed/wcsf_player_team_ball_features.npz",
+  "wcsf_labels": "data/open_data_groningen/processed/wcsf_had_labels.npz",
+  "metrica_features": "data/metrica/processed/metrica_player_team_ball_features.npz",
+  "output_root": "evaluation/wcsf_robustness_runs",
+  "severity_factors": [0.5, 1.0, 1.5],
+  "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "save_corruption_masks": false,
+  "models": [
+    {
+      "name": "without_transition_loss",
+      "run_dir": "data/open_data_groningen/model_runs/had_rf125_seq20_20261102_191013",
+      "decoder": {"method": "viterbi", "transition_penalty": 6.0},
+      "decoder_report": "data/open_data_groningen/model_runs/had_rf125_seq20_20261102_191013/postprocessing/decoding_20261102_200159/oof_comparison.json"
+    },
+    {
+      "name": "with_transition_loss_0_1",
+      "run_dir": "data/open_data_groningen/model_runs/had_rf125_seq20_20261103_091010",
+      "decoder": {
+        "method": "two_stage_viterbi",
+        "alive_transition_penalty": 10.0,
+        "ownership_transition_penalty": 2.0
+      },
+      "decoder_report": "data/open_data_groningen/model_runs/had_rf125_seq20_20261103_091010/postprocessing/decoding_20261103_094423/oof_comparison.json"
+    }
+  ]
+}

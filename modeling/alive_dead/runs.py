@@ -22,8 +22,9 @@ def _duration_token(seconds: float) -> str:
 
 def run_name(config: ExperimentConfig, created_at: datetime) -> str:
     """Return the stable human-readable identity for one experiment."""
+    prefix = f"{task_name(config)}_maskaug" if config.augmentation.enabled else task_name(config)
     return (
-        f"{task_name(config)}_rf{config.model.receptive_field_frames}"
+        f"{prefix}_rf{config.model.receptive_field_frames}"
         f"_seq{_duration_token(config.data.sequence_seconds)}"
         f"_{created_at.strftime('%Y%m%d_%H%M%S')}"
     )
@@ -45,7 +46,7 @@ def build_run_metadata(
     sequence_frames = config.seconds_to_frames(config.data.sequence_seconds, fps)
     stride_frames = config.seconds_to_frames(config.data.train_stride_seconds, fps)
     buffer_frames = config.seconds_to_frames(config.split.buffer_seconds, fps)
-    return {
+    metadata = {
         "schema_version": RUN_SCHEMA_VERSION,
         "run_name": run_name(config, created_at),
         "created_at": created_at.isoformat(),
@@ -116,6 +117,11 @@ def build_run_metadata(
         },
         "config": config.to_dict(),
     }
+    if config.augmentation.enabled:
+        from .augmentation import augmentation_provenance
+
+        metadata["mask_augmentation"] = augmentation_provenance(config)
+    return metadata
 
 
 def create_run_directory(

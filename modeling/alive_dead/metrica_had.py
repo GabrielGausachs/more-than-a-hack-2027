@@ -89,8 +89,8 @@ def load_comparison_config(path: str | Path) -> tuple[tuple[ModelSpec, ...], dic
     ):
         raise ValueError("Fold ensemble weights must be finite, non-negative and sum to one")
     models = raw.get("models")
-    if not isinstance(models, list) or len(models) != 2:
-        raise ValueError("Comparison config must define exactly two models")
+    if not isinstance(models, list) or not models:
+        raise ValueError("Comparison config must define at least one model")
     specs = []
     for item in models:
         if not isinstance(item, dict):
@@ -188,8 +188,13 @@ def _validate_model_metadata(metadata: Mapping[str, Any], spec: ModelSpec) -> No
         raise ValueError(f"{spec.name} must be a completed two-fold run")
     if metadata.get("task") != "had" or metadata.get("class_order") != ["H", "A", "D"]:
         raise ValueError(f"{spec.name} is not an H/A/D run with class order H,A,D")
-    configured = metadata.get("methodology", {}).get("transition_loss_weight")
-    configured = 0.0 if configured is None else float(configured)
+    training = metadata.get("config", {}).get("training", {})
+    transition_enabled = bool(training.get("use_transition_loss", False))
+    configured = (
+        float(training.get("transition_loss_weight", 0.1))
+        if transition_enabled
+        else 0.0
+    )
     if not np.isclose(configured, spec.expected_transition_loss_weight):
         raise ValueError(
             f"{spec.name} transition-loss weight {configured} does not match "
@@ -474,7 +479,7 @@ def run_comparison(
     bootstrap_n: int = 1000,
     show_progress: bool = True,
 ) -> Path:
-    """Run both frozen models, write four submissions and verify official metrics."""
+    """Run configured frozen models, write submissions and verify official metrics."""
     config_path = Path(config_path)
     feature_path = Path(feature_path)
     ground_truth_path = Path(ground_truth_path)

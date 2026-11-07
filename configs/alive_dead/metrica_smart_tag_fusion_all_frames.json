@@ -1,0 +1,27 @@
+{
+  "schema_version": "metrica_smart_tag_fusion_v1",
+  "model_config": "configs/alive_dead/metrica_maskaug_no_transition.json",
+  "model_name": "maskaug_without_transition_loss",
+  "features": "data/metrica/processed/metrica_player_team_ball_features.npz",
+  "smart_tags": "data/metrica/tactical/BAR-ATH_tactical_smart_tagging.xml",
+  "output_root": "evaluation/metrica_smart_tag_runs",
+  "policy": {
+    "home_team": "Barcelona",
+    "away_team": "Atletic Club",
+    "ownership_codes": [
+      "BUILD UP",
+      "PROGRESSION",
+      "ATTACKING TRANSITION",
+      "DEFENDING IN ATTACKING THIRD",
+      "DEFENDING IN MIDDLE THIRD",
+      "DEFENSIVE TRANSITION"
+    ],
+    "ownership_taper_seconds": 2.0,
+    "ownership_ball_missing_only": false,
+    "ownership_odds_multiplier": 1.5,
+    "kickoff_types": ["Kick Off (Start)", "Kick Off (After Goal)"],
+    "kickoff_odds_multiplier": 1.5,
+    "kickoff_live_seconds": 2.0,
+    "decoder": {"method": "viterbi", "transition_penalty": 1.0}
+  }
+}

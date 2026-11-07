@@ -12,6 +12,7 @@ from modeling.alive_dead.metrica_had import (
     average_categorical_probabilities,
     decode_probabilities_by_half,
     evaluate_labels,
+    load_comparison_config,
     load_global_decoder,
     reconstruct_source_labels,
     reconstruct_source_probabilities,
@@ -21,6 +22,26 @@ from modeling.alive_dead.postprocess_had import Decoder
 
 
 class MetricaHADTransferTests(unittest.TestCase):
+    def test_single_model_transfer_config_is_supported(self):
+        config = {
+            "schema_version": "metrica_had_model_comparison_v1",
+            "ensemble_weights": {"fold1": 0.5, "fold2": 0.5},
+            "models": [{
+                "name": "one_model",
+                "run_dir": "run",
+                "decoder_selection": "selection.json",
+                "expected_transition_loss_weight": 0.0,
+                "expected_decoder": {"method": "viterbi", "transition_penalty": 1.0},
+            }],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            models, weights = load_comparison_config(path)
+        self.assertEqual(len(models), 1)
+        self.assertEqual(models[0].name, "one_model")
+        self.assertEqual(weights, {1: 0.5, 2: 0.5})
+
     def test_weighted_categorical_ensemble(self):
         first = np.array([[0.8, 0.1, 0.1], [0.1, 0.7, 0.2]], dtype=np.float32)
         second = np.array([[0.2, 0.7, 0.1], [0.3, 0.2, 0.5]], dtype=np.float32)

@@ -1,0 +1,19 @@
+{
+  "schema_version": "metrica_had_model_comparison_v1",
+  "ensemble_weights": {
+    "fold1": 0.5,
+    "fold2": 0.5
+  },
+  "models": [
+    {
+      "name": "maskaug_without_transition_loss",
+      "run_dir": "data/open_data_groningen/model_runs/had_maskaug_rf125_seq20_20261107_111518",
+      "decoder_selection": "data/open_data_groningen/model_runs/had_maskaug_rf125_seq20_20261107_111518/postprocessing/decoding_20261107_114851/inner_selection.json",
+      "expected_transition_loss_weight": 0.0,
+      "expected_decoder": {
+        "method": "viterbi",
+        "transition_penalty": 1.0
+      }
+    }
+  ]
+}

@@ -26,6 +26,7 @@ evaluation/results/*.csv
 evaluation/reports/
 evaluation/scoreboard.csv
 evaluation/metrica_had_runs/
+evaluation/metrica_smart_tag_runs/
 evaluation/wcsf_robustness_runs/
 evaluation/mask_augmented_pipeline_runs/
 

@@ -102,10 +102,25 @@ python -m pip install -r requirements.txt
 ## Data setup
 
 The competition data is gated and must not be committed or redistributed. Enrol through the
-[official competition page](https://landing.mobileworldcapital.com/more-than-a-hack-2027), accept
-the terms, and use the participant-specific download link supplied by the organisers.
+[official competition page](https://landing.mobileworldcapital.com/more-than-a-hack-2027) and
+accept the terms. The supplied
+[Google Drive folder](https://drive.google.com/drive/folders/18KTDrUQX4sZXFfWnRcz09-FTehburY_K)
+can then be installed with:
 
-Extract the supplied tactical and broadcast directories under `data/metrica/`:
+```powershell
+python setup_data.py
+```
+
+The downloader supports either individual Drive files or a ZIP/TAR bundle, installs only the nine
+official tactical and broadcast assets, and never extracts arbitrary archive paths. It does not
+invoke FFmpeg, crop video, create playback assets, or download anything else. If Drive requires a
+browser sign-in, download the archive manually and run:
+
+```powershell
+python setup_data.py --bundle path\to\downloaded_bundle.zip
+```
+
+The resulting layout is:
 
 ```text
 data/
@@ -133,7 +148,7 @@ Clone the training data and check out the frozen source revision:
 
 ```powershell
 git clone https://github.com/SkillCorner/opendata.git data/external/skillcorner-opendata
-git -C data/external/skillcorner-opendata checkout 4340d274572876239c154c90bc507a9b3250a656
+git -C data/external/skillcorner-opendata checkout --detach 4340d274572876239c154c90bc507a9b3250a656
 ```
 
 Raw and derived data under `data/` are ignored by Git.

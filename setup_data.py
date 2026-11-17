@@ -19,12 +19,13 @@ ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
 
 
 def _required_files(data_dir: Path) -> Dict[str, Path]:
-    """Expected competition filename to its tactical/broadcast destination."""
+    """Expected non-video competition filename to its destination."""
 
     return {
         Path(path).name: Path(path)
         for source in ("tactical", "broadcast")
-        for path in asset_paths(data_dir=str(data_dir), source=source).values()
+        for asset, path in asset_paths(data_dir=str(data_dir), source=source).items()
+        if asset != "video"
     }
 
 
@@ -149,7 +150,7 @@ def download(data_dir: Path = DEFAULT_DATA_DIR, drive_url: str = DRIVE_URL,
     missing = [str(path) for path in required.values() if not _present(path)]
     if missing:
         raise RuntimeError("competition data is incomplete; missing:\n  " + "\n  ".join(missing))
-    print("Metrica tactical and broadcast data are ready in {}".format(data_dir))
+    print("Metrica non-video data are ready in {}".format(data_dir))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

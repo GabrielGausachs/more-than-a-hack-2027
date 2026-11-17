@@ -206,6 +206,8 @@ python -m pip install -r requirements.txt
 
 ### 2. Download the data
 
+To regenerate the exact submitted CSV without retraining, only the Metrica data is required. 
+
 The Metrica match data is distributed under the competition terms and must not be committed or
 redistributed. After accepting the terms, download the tactical and broadcast assets with:
 
@@ -220,6 +222,8 @@ manually and run:
 ```powershell
 python setup_data.py --bundle path\to\downloaded_bundle.zip
 ```
+
+If SkillCorner data wants to be downloaded too, follow these instructions:
 
 Git LFS must be installed before downloading the SkillCorner training data. From the hackathon
 repository root, use a partial clone and non-cone sparse checkout to fetch only the 20 required
@@ -268,39 +272,25 @@ Remove-Item Env:\GIT_LFS_SKIP_SMUDGE
 
 Raw and derived data under `data/` are ignored by Git.
 
-### 3. Prepare the training data
+### 3. Prepare the data
 
-Generate the SkillCorner labels and the common feature archives:
+Generate the common feature archive of metrica:
+
+```powershell
+python -m possession.preprocessing.feature_extraction metrica
+```
+The generated files are written under `data/derived/`.
+
+To generate the SkillCorner labels and the common feature archives for training:
 
 ```powershell
 python -m possession.preprocessing.labels
 python -m possession.preprocessing.feature_extraction skillcorner
-python -m possession.preprocessing.feature_extraction metrica
 ```
 
 The generated files are written under `data/derived/`.
 
-### 4. Train the model
-
-```powershell
-python -m possession.modeling.training
-```
-
-This runs the fixed 20-match, 16-epoch training configuration and writes the model, normalization,
-history, and decoder definition to `outputs/final_model/training/`.
-
-### 5. Run inference with the newly trained model
-
-```powershell
-python -m possession.inference `
-  --model-dir outputs/final_model/training `
-  --output-dir outputs/final_model
-```
-
-This explicitly loads the model, normalization and decoder produced by the new training run. It
-writes the submission to `outputs/final_model/GG.csv`.
-
-### 6. Run inference with the saved model
+### 4. Run inference with the saved model
 
 The repository includes the final model under `artifacts/final_model/`. To regenerate the exact
 submitted CSV without retraining, only the Metrica feature archive is required:
@@ -321,7 +311,7 @@ The expected output is:
 artifacts/final_model/GG.csv
 ```
 
-### 7. Validate and evaluate the submission
+### 5. Validate and evaluate the submission
 
 Before running the public diagnostic evaluation, validate the exact file with this command:
 
@@ -339,6 +329,26 @@ python evaluation/run_evaluation.py --gt public `
   --results artifacts/final_model `
   --out artifacts/final_model/evaluation
 ```
+
+### 6. Train the model
+
+```powershell
+python -m possession.modeling.training
+```
+
+This runs the fixed 20-match, 16-epoch training configuration and writes the model, normalization,
+history, and decoder definition to `outputs/final_model/training/`.
+
+### 7. Run inference with the newly trained model
+
+```powershell
+python -m possession.inference `
+  --model-dir outputs/final_model/training `
+  --output-dir outputs/final_model
+```
+
+This explicitly loads the model, normalization and decoder produced by the new training run. It
+writes the submission to `outputs/final_model/GG.csv`.
 
 ## Repository layout
 

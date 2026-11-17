@@ -124,4 +124,41 @@ Our approach does not explicitly detect each football event or apply separate ru
 
 Each official half is processed separately, avoiding possession sequences crossing halftime. For the final submission, decoded predictions are transferred back to the original 199,319-frame Metrica timeline, and frames outside the scored match periods are assigned `X`.
 
+## 4. Experiments and Evaluation
 
+### 4.1 Conservative vs. Complete Labeling
+
+One of the main challenges in constructing training labels from SkillCorner Open Data was determining the possession state in frames not covered by Phases of Play. Although these annotations describe situations when the ball is in play, their absence does not necessarily indicate a stoppage. Assigning Dead ball (`D`) to every uncovered frame could therefore introduce incorrect supervision.
+
+During exploratory analysis, we observed substantial gaps in phase coverage and disagreements between Phases of Play and tracking-derived possession information. For example, in one match, Phases of Play covered only 54.4% of the tracking frames. These observations motivated a **conservative H/A/D/U labeling strategy**, where uncertain frames are marked as Unknown (`U`) rather than assigned a potentially incorrect possession state.
+
+As described in Section 2.2, the conservative strategy uses Phases of Play to identify Home and Away possession, while Dynamic Events provide additional evidence to validate possession and identify dead-ball intervals. Frames with contradictory information or insufficient interruption evidence remain Unknown and are excluded from the training loss.
+
+We also investigated a complete H/A/D labeling strategy that assigned Dead ball to all frames not covered by a valid Phase of Play. While this increased supervision coverage, it relied on the assumption that every uncovered interval corresponded to a stoppage.
+
+Both strategies were evaluated using four SkillCorner validation matches. The conservative labeling experiment achieved a decoded spell F1 of 0.7298, compared with 0.6884 for the complete-labeling experiment. However, these values are not directly comparable because their evaluation references differ. The conservative evaluation excluded 56,681 Unknown frames and 286 possession spells adjacent to uncertain intervals, resulting in 733 evaluable ground-truth spells compared with 974 under complete labeling.
+
+We selected conservative labeling to prioritize the reliability of possession annotations, particularly around stoppages and possession boundaries. This is relevant to the challenge's primary metric, where incorrect boundaries can reduce the overlap between predicted and ground-truth possession spells, even when most individual frames are classified correctly.
+
+The main trade-off is reduced supervision coverage. Some frames marked Unknown may correspond to valid possession or dead-ball situations, but without sufficient evidence, we preferred excluding them from the loss rather than introducing potentially incorrect labels.
+
+### 4.2 Standard vs. Possession-Duration Weighted Cross-Entropy
+
+We compared standard cross-entropy (CE) with possession-duration weighted cross-entropy using the conservative H/A/D/U labeling strategy. Both approaches were evaluated on the same four SkillCorner validation matches, with the remaining 16 matches used for training. Predictions were decoded using Viterbi with a fixed transition penalty of 1.5.
+
+| Loss function | Decoded spell F1 | Frame macro-F1 | Predicted possessions |
+|---|---:|---:|---:|
+| Standard CE | 0.6906 | 0.9105 | 746 |
+| Duration-weighted CE | **0.7298** | **0.9214** | 847 |
+
+Duration-weighted CE improved possession-spell F1 by approximately 0.039 while also improving frame macro-F1.
+
+These results supported our decision to use possession-duration weighted cross-entropy in the final training configuration.
+
+### 4.3 Smart Tag Fusion
+
+We also explored incorporating Metrica's automatic tactical Smart Tags into the possession predictions. These annotations identify tactical phases such as build-up, progression, attacking transitions, and chance creation, which can provide additional evidence about the team in possession.
+
+During exploratory analysis, we observed that the Smart Tags were generally more reliable in the middle of annotated intervals, while their start and end boundaries were less precise. We therefore experimented with combining the model's class probabilities with confidence-weighted Smart Tag evidence, increasing the probability assigned to the team associated with the active tactical phase.
+
+However, the additional information did not provide sufficiently consistent evidence of improved possession reconstruction, particularly around transitions and possession boundaries. Since the model already incorporated spatial and temporal information from tracking, we retained the simpler tracking-only approach without Smart Tag fusion.

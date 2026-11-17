@@ -221,11 +221,49 @@ manually and run:
 python setup_data.py --bundle path\to\downloaded_bundle.zip
 ```
 
-Clone the SkillCorner training data and check out the exact revision used in this project:
+Git LFS must be installed before downloading the SkillCorner training data. From the hackathon
+repository root, use a partial clone and non-cone sparse checkout to fetch only the 20 required
+match folders and the match catalogue at the exact revision used in this project. 
 
 ```powershell
-git clone https://github.com/SkillCorner/opendata.git data/external/skillcorner-opendata
-git -C data/external/skillcorner-opendata checkout --detach 4340d274572876239c154c90bc507a9b3250a656
+# Enable Git LFS
+git lfs install
+
+# Prevent automatic LFS downloads
+$env:GIT_LFS_SKIP_SMUDGE = "1"
+
+# Clone without downloading all repository contents
+git clone --filter=blob:none --no-checkout https://github.com/SkillCorner/opendata.git data/external/skillcorner-opendata
+
+# Enter the cloned repository
+cd data/external/skillcorner-opendata
+
+# Define the required matches
+$ids = @(
+    1874553, 1886347, 1899585, 1925299, 1927964,
+    1953632, 1959846, 1986691, 1996435, 1996436,
+    2006229, 2006363, 2007448, 2007721, 2010085,
+    2011166, 2013725, 2015213, 2016236, 2017461
+)
+
+# Select only these matches and the match catalogue
+$patterns = @("/data/matches.json") + @(
+    $ids | ForEach-Object { "/data/matches/$_/" }
+)
+
+git sparse-checkout set --no-cone -- $patterns
+
+# Checkout the pinned revision
+git checkout --detach 4340d274572876239c154c90bc507a9b3250a656
+
+# Download the required tracking files
+git lfs pull --include="data/matches/*/*_tracking_extrapolated.jsonl" --exclude=""
+
+# Return to the hackathon repository root
+cd ../../..
+
+# Restore normal Git LFS behavior
+Remove-Item Env:\GIT_LFS_SKIP_SMUDGE
 ```
 
 Raw and derived data under `data/` are ignored by Git.

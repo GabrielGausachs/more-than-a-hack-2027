@@ -22,6 +22,8 @@ On the provided five-minute public diagnostic window, the final model achieves:
 |---:|---:|---:|---:|
 | **0.6857** | **0.7429** | **0.8824** | **0.8945** |
 
+![Ground-truth and predicted possession timeline for the public diagnostic window](figures/timeplot.png)
+
 The public window is used only for diagnostic reporting after the pipeline is fixed. It was not
 used for training, parameter tuning, decoder selection, or model selection.
 

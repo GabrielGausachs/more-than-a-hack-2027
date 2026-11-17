@@ -1,4 +1,9 @@
-# Football Possession Reconstruction from Tracking Data
+# Decoding Possession
+### From Player Tracking to Football Possession Spells
+
+**Gabriel Gausachs | Team GG**
+
+*Metrica Sports — More Than a Hack 2027*
 
 ## 1. Introduction and Approach Overview
 
@@ -163,6 +168,26 @@ During exploratory analysis, we observed that the Smart Tags were generally more
 
 However, the additional information did not provide sufficiently consistent evidence of improved possession reconstruction, particularly around transitions and possession boundaries. Since the model already incorporated spatial and temporal information from tracking, we retained the simpler tracking-only approach without Smart Tag fusion.
 
+### 4.4 Final Evaluation on Metrica
+
+We evaluated our final model using the official evaluator on the provided five-minute public ground-truth interval, containing 7,500 graded frames and 17 possession spells. This evaluation was used to assess the complete inference pipeline, including the transfer from SkillCorner to Metrica tracking, temporal decoding, and reconstruction of the original 25 Hz timeline.
+
+| Metric | Result |
+|---|---:|
+| **Possession-spell F1** | **0.6857** |
+| Frame macro-F1 | 0.8824 |
+| Frame accuracy | 0.8945 |
+| Spell F1 at IoU 0.5 | 0.7429 |
+| Transition F1 (±25 frames) | 0.5116 |
+| Predicted / ground-truth possessions | 18 / 17 |
+| Mean possession duration (predicted / GT) | 13.8 s / 14.2 s |
+
+The model achieved a frame-level F1 of **0.9255 for Home possession**, **0.8828 for Away possession**, and **0.8390 for Dead ball**. Dead-ball detection remained the most challenging class, with a precision of 0.9002 and recall of 0.7856, indicating that some stoppage frames were incorrectly classified as active possession.
+
+At an IoU threshold of 0.5, the model matched 13 of the 17 ground-truth possessions. It predicted 18 possessions overall, with a mean duration close to the ground truth. However, the lower transition F1 indicates that accurately identifying possession boundaries remains more difficult than classifying individual frames.
+
+These results provide an initial indication of the model's ability to transfer from SkillCorner to Metrica tracking. Nevertheless, the public ground truth covers only a small portion of the match, and performance over the complete match cannot be reliably established from this evaluation alone.
+
 ## 5. Limitations and Future Work
 
 The main limitation of our approach is the **domain shift between SkillCorner and Metrica tracking data**. Although both providers are converted into the same feature representation, their underlying data distributions are not necessarily equivalent. Differences in tracking quality, player availability, speed estimation, and missing observations can affect how well the model generalizes to the target match.
@@ -235,21 +260,20 @@ To generate predictions using this newly trained model:
 ```powershell
 python -m possession.inference `
   --model-dir outputs/final_model/training `
-  --output-dir outputs/final_model `
-  --submission-name metrica_possession.csv
+  --output-dir outputs/final_model
 ```
 
 Alternatively, the repository includes the saved final model under `artifacts/final_model/`, allowing the submission to be regenerated without retraining. After preparing the Metrica data, run:
 
 ```powershell
 python -m possession.preprocessing.feature_extraction metrica
-python -m possession.inference --submission-name metrica_possession.csv
+python -m possession.inference
 ```
 
 By default, inference uses the model and settings specified in `configs/inference.json`. The generated submission is saved as:
 
 ```text
-artifacts/final_model/metrica_possession.csv
+artifacts/final_model/GG.csv
 ```
 
 ### 6.3 Final Artifact and Validation
@@ -259,7 +283,7 @@ The final submission is a CSV containing the columns `frame,label`, with one pre
 Validate the submission using the official validator:
 
 ```powershell
-python evaluation/validate_submission.py artifacts/final_model/metrica_possession.csv
+python evaluation/validate_submission.py artifacts/final_model/GG.csv
 ```
 
 To evaluate the submission against the available public ground truth:

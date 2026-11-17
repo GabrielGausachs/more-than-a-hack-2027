@@ -54,7 +54,7 @@
     "matplotlib": "3.10.7"
   },
   "expected_submission": {
-    "file": "metrica_possession.csv",
+    "file": "GG.csv",
     "sha256": "171882f7fc390421fd4fe35f65f2652eb78892eea876694d50cec445a787da48",
     "frames": 199319,
     "graded_frames": 158857,

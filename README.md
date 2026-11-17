@@ -199,7 +199,7 @@ All commands below are run from the repository root.
 The final environment uses Python 3.12.10 and pinned package versions.
 
 ```powershell
-conda create --name metrica-hackathon python=3.12.10 pip -y
+conda create --name metrica-hackathon python=3.12 pip -y
 conda activate metrica-hackathon
 python -m pip install -r requirements.txt
 ```

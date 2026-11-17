@@ -162,3 +162,112 @@ We also explored incorporating Metrica's automatic tactical Smart Tags into the 
 During exploratory analysis, we observed that the Smart Tags were generally more reliable in the middle of annotated intervals, while their start and end boundaries were less precise. We therefore experimented with combining the model's class probabilities with confidence-weighted Smart Tag evidence, increasing the probability assigned to the team associated with the active tactical phase.
 
 However, the additional information did not provide sufficiently consistent evidence of improved possession reconstruction, particularly around transitions and possession boundaries. Since the model already incorporated spatial and temporal information from tracking, we retained the simpler tracking-only approach without Smart Tag fusion.
+
+## 5. Limitations and Future Work
+
+The main limitation of our approach is the **domain shift between SkillCorner and Metrica tracking data**. Although both providers are converted into the same feature representation, their underlying data distributions are not necessarily equivalent. Differences in tracking quality, player availability, speed estimation, and missing observations can affect how well the model generalizes to the target match.
+
+Metrica tracking also contains missing or inaccurate player and ball observations, including occasional duplicated players and unavailable speed measurements. Although our feature representation includes validity indicators and the Deep Sets encoder can handle variable numbers of players, these mechanisms do not completely eliminate the effects of unreliable tracking data.
+
+Another limitation is the **lack of sufficient labeled Metrica data for evaluating generalization**. The complete match ground truth is private, and the public evaluation covers only 7,500 frames and 17 possession spells. Therefore, even if the model performs well on external SkillCorner validation, we cannot reliably establish how well it reconstructs possession across the entire Metrica match.
+
+Finally, our training labels are derived from SkillCorner's Phases of Play and Dynamic Events rather than independently verified frame-level annotations. The conservative labeling strategy reduces uncertainty by excluding unsupported frames, but it also reduces supervision coverage and may omit useful possession situations.
+
+Future improvements could focus on stronger cross-provider robustness, including realistic tracking-missingness augmentation and additional labeled matches from different providers. More accurate possession-boundary modeling and training objectives that directly consider possession spells could also help improve the primary evaluation metric.
+
+## 6. Reproducibility and Submission
+
+This section describes how to reproduce the pipeline, either by training the model from SkillCorner Open Data or by running inference with the saved model. All commands are executed from the repository root.
+
+### 6.1 Requirements and Data
+
+Create the Conda environment and install the required dependencies:
+
+```powershell
+conda create --name metrica-hackathon python=3.12.10 pip -y
+conda activate metrica-hackathon
+python -m pip install -r requirements.txt
+```
+
+Download the Metrica competition data after accepting its usage terms:
+
+```powershell
+python setup_data.py
+```
+
+If the download requires manual authentication, the downloaded archive can be installed using:
+
+```powershell
+python setup_data.py --bundle path\to\downloaded_bundle.zip
+```
+
+Clone SkillCorner Open Data and check out the revision used for training:
+
+```powershell
+git clone https://github.com/SkillCorner/opendata.git data/external/skillcorner-opendata
+git -C data/external/skillcorner-opendata checkout --detach 4340d274572876239c154c90bc507a9b3250a656
+```
+
+The Metrica data is stored under `data/metrica/`, while SkillCorner data is stored under `data/external/skillcorner-opendata/`. Raw and derived data are excluded from version control.
+
+### 6.2 Training and Inference
+
+Generate the SkillCorner supervision labels and extract the common features for both providers:
+
+```powershell
+python -m possession.preprocessing.labels
+python -m possession.preprocessing.feature_extraction skillcorner
+python -m possession.preprocessing.feature_extraction metrica
+```
+
+The generated labels and feature archives are saved under `data/derived/`.
+
+To reproduce the final training procedure, run:
+
+```powershell
+python -m possession.modeling.training
+```
+
+This uses the fixed configuration in `configs/training.json`, training the model on all 20 SkillCorner matches for 16 epochs. The model checkpoint, normalization statistics, training history, and decoder configuration are written to `outputs/final_model/training/`.
+
+To generate predictions using this newly trained model:
+
+```powershell
+python -m possession.inference `
+  --model-dir outputs/final_model/training `
+  --output-dir outputs/final_model `
+  --submission-name metrica_possession.csv
+```
+
+Alternatively, the repository includes the saved final model under `artifacts/final_model/`, allowing the submission to be regenerated without retraining. After preparing the Metrica data, run:
+
+```powershell
+python -m possession.preprocessing.feature_extraction metrica
+python -m possession.inference --submission-name metrica_possession.csv
+```
+
+By default, inference uses the model and settings specified in `configs/inference.json`. The generated submission is saved as:
+
+```text
+artifacts/final_model/metrica_possession.csv
+```
+
+### 6.3 Final Artifact and Validation
+
+The final submission is a CSV containing the columns `frame,label`, with one prediction for each of the 199,319 original Metrica frames. Predictions within the scored match periods are `H`, `A`, or `D`, while frames outside these periods are assigned `X`.
+
+Validate the submission using the official validator:
+
+```powershell
+python evaluation/validate_submission.py artifacts/final_model/metrica_possession.csv
+```
+
+To evaluate the submission against the available public ground truth:
+
+```powershell
+python evaluation/run_evaluation.py --gt public `
+  --results artifacts/final_model `
+  --out artifacts/final_model/evaluation
+```
+
+The validator checks the submission format, frame ordering, number of frames, and allowed labels. The public evaluator produces the available frame-level and possession-spell metrics.

@@ -1,0 +1,32 @@
+{
+  "archive_root": "data/derived/feature_extracted/skillcorner",
+  "match_ids": [1874553, 1886347, 1899585, 1925299, 1927964, 1953632, 1959846, 1986691, 1996435, 1996436, 2006229, 2006363, 2007448, 2007721, 2010085, 2011166, 2013725, 2015213, 2016236, 2017461],
+  "output_dir": "outputs/final_model/training",
+  "epochs": 16,
+  "seed": 2027,
+  "device": "auto",
+  "model": {
+    "player_hidden": 32,
+    "player_embedding": 64,
+    "hidden_channels": 64,
+    "dilations": [1, 2, 4, 8, 16],
+    "dropout": 0.1
+  },
+  "training": {
+    "core_size": 512,
+    "batch_size": 8,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001
+  },
+  "loss": {
+    "type": "possession_duration_weighted",
+    "reference_duration_s": 8.0,
+    "minimum_weight": 0.25,
+    "maximum_weight": 4.0
+  },
+  "decoder": {
+    "method": "viterbi",
+    "switch_penalty": 1.5,
+    "probability_epsilon": 1e-8
+  }
+}

@@ -1,194 +1,233 @@
-# More than a Hack 2027 — Phase 1: Ball Possession
+# More Than a Hack 2027 — Tracking-Only Possession Prediction
 
-**Organised by [Metrica Sports](https://metrica-sports.com), [FC Barcelona](https://www.fcbarcelona.com)
-and the [Mobile World Capital Barcelona](https://www.mwcbarcelona.com)**, at the Talent Arena in Barcelona.
+This repository contains the final submission pipeline for the Metrica Sports **More Than a Hack
+2027 — Phase 1: Ball Possession** challenge. For every frame of the FC Barcelona–Athletic Club
+match, the system predicts Home possession (`H`), Away possession (`A`), dead ball (`D`), or `X`
+outside the official scored periods.
 
-A football data challenge on real professional match data, open to analysts, data scientists and
-engineers. You are given one complete LaLiga match — two camera feeds, automatic tracking of every
-player and the ball, automatic tactical tagging, and the camera-to-pitch geometry — and one
-question to answer with it.
+The selected solution uses only automatic tracking at inference time. Metrica Smart Tags,
+broadcast video, homography, manual corrections, and public ground-truth labels are not used to
+produce the submission.
 
----
+## Final approach
 
-## The task
+### Training data and labels
 
-**For every frame of the match, say who has the ball.**
+The model is trained on all 20 matches from
+[SkillCorner Open Data](https://github.com/SkillCorner/opendata), fixed at commit
+`4340d274572876239c154c90bc507a9b3250a656`.
 
+The deterministic `skillcorner_final_v1` policy builds four frame labels:
+
+- `H` and `A` from valid Phases of Play and player-possession evidence;
+- `D` from strictly supported interruption gaps;
+- `U` where the available annotations do not support a reliable label.
+
+The frozen aggregate label counts are:
+
+| H | A | D | U |
+|---:|---:|---:|---:|
+| 319,399 | 308,895 | 288,850 | 327,670 |
+
+`U` frames are excluded from supervised loss but remain available as temporal context. Official
+P1/P2 metadata isolates the two halves; halftime and out-of-period frames never enter model
+sequences.
+
+### Features
+
+SkillCorner and Metrica are converted to the same `common_tracking_v1` schema at 10 Hz. Coordinates
+are expressed in canonical pitch-centred metres with Home always attacking in the positive x
+direction. Inputs include:
+
+- per-player x/y position, speed, position validity and speed validity;
+- team centroids, spread, compactness, valid-player counts and speed statistics;
+- relative Home/Away geometry;
+- ball position, displacement, missingness duration and player proximity;
+- one-second team temporal changes and explicit validity indicators.
+
+Invalid measurements remain neutral zero and are accompanied by validity features. Normalization
+is fitted on the 20 SkillCorner matches and stored with the model.
+
+### Model and training
+
+Each team is encoded independently with a Deep Sets player MLP (`5 → 32 → 64`) and masked mean
+pooling. The two team embeddings are concatenated with 51 engineered features and processed by a
+64-channel noncausal temporal convolutional network with residual dilation blocks
+`[1, 2, 4, 8, 16]`. The receptive field is 125 samples, or 12.5 seconds at 10 Hz.
+
+The final model is trained for exactly 16 epochs on all 20 matches with AdamW, learning rate
+`0.001`, weight decay `0.0001`, batch size `8`, core length `512`, dropout `0.1`, and seed `2027`.
+There is no validation split or checkpoint selection in this final refit; epoch 16 is saved.
+
+Training uses possession-duration weighted cross-entropy. Complete interior H/A spells receive:
+
+```text
+clip(8 / duration_seconds, 0.25, 4.0)
 ```
-frame,label
-11185,A        away in possession, ball alive
-11186,A
-...
-18240,D        dead ball
-...
-18684,H        home in possession, ball alive
+
+H/A spells touching `U` or a period boundary and all `D` frames receive weight 1. `U` and
+out-of-period frames receive weight 0.
+
+### Metrica inference
+
+Each official Metrica half is sampled independently from 25 Hz to 10 Hz using nearest timestamps,
+with the earlier frame selected on an exact tie. The model probabilities are decoded independently
+inside P1 and P2 with Viterbi switch penalty `1.5` and probability epsilon `1e-8`, then mapped back
+to the original 199,319-frame tactical timeline. Official half blocks receive H/A/D and all other
+frames receive X.
+
+## Environment
+
+The final environment is Python `3.12.10`. Create a clean environment and install the single
+pinned dependency file.
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-That is the whole task. One CSV, one row per video frame, 199,319 rows. It is scored automatically
-against a private frame-by-frame ground truth, so there is a number at the end and no argument
-about it — no jury, and no presentation to argue from.
-
-The tracking is automatic and uncorrected: it has gaps and identity
-switches, and the ball itself is invisible on 41% of the frames you are scored on.
-
----
-
-## The challenge in one screen
-
-| |                                                                                                                           |
-|---|---------------------------------------------------------------------------------------------------------------------------|
-| **Input** | one full match: tactical video, broadcast video, automatic tracking **with the ball** for both, Smart Tagging, homography |
-| **Output** | `frame,label` CSV, 199,319 rows, labels `H` / `A` / `D` / `X`                                                             |
-| **Ranked on** | `spellF1` — how many of the match's real possessions you recovered as whole possessions                                   |
-| **Also reported** | `macroF1` — the per-frame view, and the first tie-break                                                                   |
-| **Baseline to beat** | `spellF1` **0.2433**, in this repository                                                                                  |
-| **Ground truth you get** | the first **5 minutes** of play — to check your pipeline, not to train on                                              |
-| **Ground truth you are scored on** | the full match, **private**                                                                                               |
-
-It is deliberately **not** a tracking challenge. The tracking, tagging and homography are given to
-you so that nobody has to rebuild detection, re-identification and camera calibration before
-getting to the actual question. See [CHALLENGE.md](CHALLENGE.md).
-
----
-
-## Try it right now
-
-The scorer, a 5-minute ground truth and four working baselines are in this repository. No
-enrolment, no download, no data:
+macOS/Linux:
 
 ```bash
-pip install -r requirements.txt
-python evaluation/run_evaluation.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Scored on the public 5 minutes, not on the full match -- which is why the order below is not the
-order of the floor quoted above:
+## Data setup
 
+The competition data is gated and must not be committed or redistributed. Enrol through the
+[official competition page](https://landing.mobileworldcapital.com/more-than-a-hack-2027), accept
+the terms, and use the participant-specific download link supplied by the organisers.
+
+Extract the supplied tactical and broadcast directories under `data/metrica/`:
+
+```text
+data/
+├── metrica/
+│   ├── tactical/
+│   │   ├── BAR-ATH_tactical.mp4
+│   │   ├── BAR-ATH_tactical_atd.xml
+│   │   ├── BAR-ATH_tactical_atd.txt
+│   │   ├── BAR-ATH_tactical_homography.csv
+│   │   └── BAR-ATH_tactical_smart_tagging.xml
+│   └── broadcast/
+│       ├── BAR-ATH_broadcast.mp4
+│       ├── BAR-ATH_broadcast_atd.xml
+│       ├── BAR-ATH_broadcast_atd.txt
+│       └── BAR-ATH_broadcast_homography.csv
+├── external/
+│   └── skillcorner-opendata/
+└── derived/
 ```
-scoreboard  gt/BAR-ATH_possession_gt_public.csv  199319 frames  7500 graded  21 gt segments
-ground truth has 17 possessions of mean 14.2 s  <- compare the poss and dur columns
 
-rank  submission                macroF1  spellF1   poss     dur  
-----  ------------------------  -------  -------  -----  ------  
-   1  baseline_smooth125         0.5812   0.4242     16    18.5  
-   2  baseline_smooth50          0.6207   0.3256     26    10.8  
-   3  baseline_smooth25          0.6200   0.2868     36     7.6  
-   4  baseline_raw               0.5972   0.0378    131     2.0  
+The final pipeline consumes only the tactical ATD XML and TXT files. Broadcast assets are retained
+for completeness but are not used. No playback application or derived video is created.
+
+Clone the training data and check out the frozen source revision:
+
+```powershell
+git clone https://github.com/SkillCorner/opendata.git data/external/skillcorner-opendata
+git -C data/external/skillcorner-opendata checkout 4340d274572876239c154c90bc507a9b3250a656
 ```
 
-Those four are **the same algorithm four times** — nearest tracked player to the ball, then a
-majority vote over a window. Only the window changes. `macroF1` barely moves; `spellF1` moves by a
-factor of eleven. That disagreement is the whole point of the metric, and
-[EVALUATION.md](EVALUATION.md) explains it.
+Raw and derived data under `data/` are ignored by Git.
 
-Once you have the data, regenerate them yourself and go further:
+## Reproduce the submitted CSV
 
-```bash
-python starter/baseline.py                              # rebuild the four baselines
-python evaluation/validate_submission.py <your>.csv     # before every submission
+The committed `artifacts/final_model/` directory contains the frozen epoch-16 checkpoint,
+normalization statistics and decoder definition. With the Metrica data installed, regenerate the
+exact submission with:
+
+```powershell
+python -m possession.preprocessing.feature_extraction metrica
+python -m possession.inference
 ```
 
-**Validate every file before you submit it.** `validate_submission.py` runs exactly the checks the
-official scorer runs, and a file that fails them is dropped from the board with a one-line reason.
-It takes two seconds and it is the single most common way a good entry scores nothing.
+This writes:
 
----
+```text
+outputs/final_model/submission/metrica_possession.csv
+outputs/final_model/submission/prediction_statistics.json
+```
 
-## Getting the data
+The expected SHA-256 of `metrica_possession.csv` is:
 
-The match assets are released to enrolled participants who have accepted the terms of use.
+```text
+171882f7fc390421fd4fe35f65f2652eb78892eea876694d50cec445a787da48
+```
 
-1. Enrol: **[More than A Hack 2027](https://landing.mobileworldcapital.com/more-than-a-hack-2027)**
-2. Read and sign the terms and conditions in the registration form
-3. You receive a download link.
-4. Unpack it into `./data`, or point `MTAH_DATA_DIR` at wherever you put it.
+The expected full-match statistics are H=60,117, A=32,657, D=66,083, X=40,462 and 357 predicted
+possession spells.
 
-Full description of every asset and how the frames line up: **[DATA.md](DATA.md)**.
+## Rebuild labels, features and model
 
----
+To reproduce the complete training pipeline instead of using the committed checkpoint:
 
-## Read these, in this order
+```powershell
+python -m possession.preprocessing.labels
+python -m possession.preprocessing.feature_extraction skillcorner
+python -m possession.preprocessing.feature_extraction metrica
+python -m possession.modeling.training
+python -m possession.inference --model-dir outputs/final_model/training
+```
 
-| | |
+Generated data and training outputs are written under `data/derived/` and `outputs/final_model/`.
+Retraining is documented for methodological reproducibility; the committed frozen artifacts are
+the authoritative path for byte-identical submission regeneration across different hardware.
+
+## Validate, evaluate and inspect
+
+Validate the exact CSV before submission:
+
+```powershell
+python evaluation/validate_submission.py outputs/final_model/submission/metrica_possession.csv
+```
+
+The file must contain exactly `frame,label`, 199,319 ordered frames `0…199318`, and only H/A/D/X.
+There are 158,857 scored H/A/D frames and 40,462 X frames.
+
+Run the unchanged official evaluator on the provided public five-minute ground truth:
+
+```powershell
+python evaluation/run_evaluation.py --gt public `
+  --results outputs/final_model/submission `
+  --out outputs/final_model/submission/evaluation
+```
+
+Generate the optional public diagnostic timeline:
+
+```powershell
+python -m possession.plot_timeline --gt public `
+  --submission outputs/final_model/submission/metrica_possession.csv
+```
+
+The public interval gives mean spell F1 `0.685714`, spell F1 at IoU 0.5 `0.742857`, macro-F1
+`0.882434`, and accuracy `0.894533`. These figures are diagnostic only: public labels were not
+used to train, tune, select or alter the final model.
+
+For the official upload, rename the generated file to `<team_name>.csv` as required by
+[SUBMISSION.md](SUBMISSION.md).
+
+## Frozen artifact hashes
+
+| File | SHA-256 |
 |---|---|
-| **[CHALLENGE.md](CHALLENGE.md)** | the problem, the four labels, what counts as possession |
-| **[DATA.md](DATA.md)** | every provided asset, its format, and the frame alignment |
-| **[EVALUATION.md](EVALUATION.md)** | how you are scored, and why — read before optimising anything |
-| **[SUBMISSION.md](SUBMISSION.md)** | the file contract, the three deliverables, how to submit |
-| **[RULES.md](RULES.md)** | what you may and may not do |
-| **[FAQ.md](FAQ.md)** | |
-| **[OVERVIEW.md](OVERVIEW.md)** | the competition as a whole — context, why the 2027 format changed, the calendar |
+| `artifacts/final_model/model.pt` | `9e3b0633365d5b86fe1a61754b2f81c52fed8d20418410ca274855e102a16c14` |
+| `artifacts/final_model/normalization.npz` | `20dd6ac19a175fbb9280475c488a70568743073f42356f6ec6d8c991ec96aeb6` |
+| `artifacts/final_model/final_decoder.json` | `6e97cae84baea0967c1afb0c36ce5f80c3972fd8eda04a12f975bd2f0d4c020` |
 
+Additional official documentation remains available in [CHALLENGE.md](CHALLENGE.md),
+[DATA.md](DATA.md), [EVALUATION.md](EVALUATION.md), [SUBMISSION.md](SUBMISSION.md), and
+[RULES.md](RULES.md).
 
----
+## Licence
 
-## What is in this repository
-
-```
-games.py                    per-match constants, asset paths and the frame alignment
-evaluation/
-  possession_metrics.py     the metric library — every number on the board is defined here
-  run_evaluation.py         the scorer. This exact file produces the official result
-  validate_submission.py    check a file before you send it
-  gt/                       the public 5-minute ground truth
-  results/                  the four baselines; put your submissions here
-starter/
-  baseline.py               the reference baseline, numpy only
-  load_atd.py               read the tracking and line it up with video frames
-  load_smart_tagging.py     read the tactical tagging as video-frame intervals
-  load_homography.py        read the homography; project pitch <-> pixels
-  utils.py                  pitch plotting for the notebooks
-  01_smart_tagging.ipynb    guided tour of the tactical tagging
-  02_tracking_atd.ipynb     guided tour of the tracking data, with plots
-  03_first_submission.ipynb data in, scored submission out — start here
-data/                       unpack the downloaded match assets here. Empty in a fresh clone
-```
-
-The scorer you run locally is the scorer that decides the competition. If it scores on your
-machine, it scores the same way on ours.
-
----
-
-## Requirements
-
-**Python 3.8 or newer.** The evaluation needs `numpy` and `pandas` and nothing else; it is tested
-under 3.8 and 3.11 and produces identical output under both. `starter/baseline.py` needs nothing
-more either — you can reach a scored submission without installing anything else.
-
-The notebooks additionally want `kloppy` and `matplotlib` (`requirements-starter.txt`), and
-**Python 3.9+ is recommended for those**: on Windows, installing Jupyter under 3.8 hits a
-`pywinpty` build failure that has nothing to do with this repository.
-
----
-
-## Timeline
-
-| |                |
-|---|----------------|
-| registration opens | **October 1, 2026** |
-| data released | **October 20, 2026** |
-| submission deadline | **November 17, 2026** |
-| results announced | **Before November 26, 2026**      |
-
----
-
-## Questions
-
-Open an issue for anything about the data, the metrics or the documentation — corrections are
-genuinely useful, and a fix that helps you helps everyone equally. For enrolment and the terms of
-use: **hackathon.talentarena@mobileworldcapital.com**.
-
-## Licence and citation
-
-The code and documentation in this repository are released under the MIT Licence — see
-[LICENSE](LICENSE). **The match data is not covered by it**: it is separately licensed for this
-competition only, under the terms you accept at enrolment.
-
-```bibtex
-@misc{mtah2027,
-  title  = {More than a Hack 2027: Phase 1 - Ball Possession},
-  author = {Metrica Sports and FC Barcelona Innovation Hub},
-  year   = {2027},
-  url    = {https://github.com/metrica-sports/more-than-a-hack-2027}
-}
-```
+Repository code is covered by [LICENSE](LICENSE). Metrica match assets use separate competition
+terms and are not redistributable. SkillCorner Open Data retains its upstream licence and
+attribution requirements.

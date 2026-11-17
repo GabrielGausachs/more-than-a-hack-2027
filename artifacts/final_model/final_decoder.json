@@ -1,0 +1,10 @@
+{
+  "decoder": {
+    "method": "viterbi",
+    "switch_penalty": 1.5,
+    "probability_epsilon": 1e-08
+  },
+  "checkpoint_epoch": 16,
+  "validation_match_ids": [],
+  "metrics": {}
+}

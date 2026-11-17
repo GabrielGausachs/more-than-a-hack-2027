@@ -1,0 +1,8 @@
+{
+  "model_dir": "artifacts/final_model",
+  "output_dir": "outputs/final_model/submission",
+  "game": "BAR-ATH",
+  "archive": "data/derived/feature_extracted/metrica/BAR-ATH_tactical.npz",
+  "target_rate_hz": 10.0,
+  "submission_name": "metrica_possession.csv"
+}

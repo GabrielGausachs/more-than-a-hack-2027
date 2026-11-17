@@ -196,7 +196,7 @@ All commands below are run from the repository root.
 
 ### 1. Create the Conda environment
 
-The final environment uses Python 3.12.10 and pinned package versions.
+The final environment uses Python 3.12 and pinned package versions.
 
 ```powershell
 conda create --name metrica-hackathon python=3.12 pip -y

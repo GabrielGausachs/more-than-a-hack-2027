@@ -115,7 +115,7 @@ We use **possession-duration weighted cross-entropy** to reduce the dominance of
 
 Training uses 512-frame central sequences, with extra temporal context on either side corresponding to the TCN's receptive-field radius. The model sees these surrounding observations, but the loss is evaluated only on the central frames. This avoids learning from predictions whose context is truncated by artificial sequence boundaries; at official half boundaries, missing context is padded.
 
-During development, the 20 SkillCorner matches were divided into **16 training matches and 4 validation matches**, with no overlap between the sets. Checkpoints were assessed using possession-spell F1 **after Viterbi decoding**, with a fixed switch penalty of `1.5` selected in earlier external experiments. This emphasizes the challenge's primary metric rather than only frame accuracy.
+During development, the 20 SkillCorner matches were divided into **16 training matches and 4 validation matches**, with no overlap between the sets. Checkpoints were assessed using possession-spell F1 **after Viterbi decoding**. The switch penalty of `1.5` was fixed during development using SkillCorner validation and was not tuned on Metrica ground truth. This emphasizes the challenge's primary metric rather than only frame accuracy.
 
 For the final model, the selected configuration was trained on **all 20 matches for 16 epochs**, with the architecture, loss parameters, and decoder settings fixed. No Metrica ground-truth labels are used for training or checkpoint selection.
 
@@ -135,7 +135,7 @@ Each official half is processed separately, avoiding possession sequences crossi
 
 One of the main challenges in constructing training labels from SkillCorner Open Data was determining the possession state in frames not covered by Phases of Play. Although these annotations describe situations when the ball is in play, their absence does not necessarily indicate a stoppage. Assigning Dead ball (`D`) to every uncovered frame could therefore introduce incorrect supervision.
 
-During exploratory analysis, we observed substantial gaps in phase coverage and disagreements between Phases of Play and tracking-derived possession information. For example, in one match, Phases of Play covered only 54.4% of the tracking frames. These observations motivated a **conservative H/A/D/U labeling strategy**, where uncertain frames are marked as Unknown (`U`) rather than assigned a potentially incorrect possession state.
+During exploratory analysis, we observed substantial gaps in phase coverage and disagreements between Phases of Play and tracking-derived possession information. In several matches, Phases of Play covered only around half of the official-period tracking frames. These observations motivated a **conservative H/A/D/U labeling strategy**, where uncertain frames are marked as Unknown (`U`) rather than assigned a potentially incorrect possession state.
 
 As described in Section 2.2, the conservative strategy uses Phases of Play to identify Home and Away possession, while Dynamic Events provide additional evidence to validate possession and identify dead-ball intervals. Frames with contradictory information or insufficient interruption evidence remain Unknown and are excluded from the training loss.
 
@@ -162,11 +162,13 @@ These results supported our decision to use possession-duration weighted cross-e
 
 ### 4.3 Smart Tag Fusion
 
-We also explored incorporating Metrica's automatic tactical Smart Tags into the possession predictions. These annotations identify tactical phases such as build-up, progression, attacking transitions, and chance creation, which can provide additional evidence about the team in possession.
+We also explored whether Metrica's automatic tactical Smart Tags could provide useful auxiliary possession evidence. These annotations describe broad tactical phases such as build-up, progression, attacking transitions, and chance creation. Direct attacking tags can support the named team's possession, while complementary defensive tags can provide evidence for the opposing team. They are therefore informative about the general state of play, but they are not exact frame-level possession annotations.
 
-During exploratory analysis, we observed that the Smart Tags were generally more reliable in the middle of annotated intervals, while their start and end boundaries were less precise. We therefore experimented with combining the model's class probabilities with confidence-weighted Smart Tag evidence, increasing the probability assigned to the team associated with the active tactical phase.
+To account for this distinction, we tested a conservative probability-fusion procedure rather than replacing the model's predictions directly. Smart Tag support was strongest near the centre of each annotated interval and reduced towards its boundaries, where the precise start or end of possession was less certain. The resulting evidence was combined with the tracking model's H/A/D probabilities before applying the same temporal decoder. Overlapping evidence for different teams was retained as competing evidence rather than resolved with a hand-written correction.
 
-However, the additional information did not provide sufficiently consistent evidence of improved possession reconstruction, particularly around transitions and possession boundaries. Since the model already incorporated spatial and temporal information from tracking, we retained the simpler tracking-only approach without Smart Tag fusion.
+The fused sequence remained very similar to the tracking-only sequence. Most Smart Tag evidence agreed with the possession state already inferred from tracking, and the remaining differences were concentrated around ambiguous transitions and interval boundaries. Consequently, the fusion changed only a limited part of the predicted sequence and did not materially alter the overall possession reconstruction.
+
+This comparison indicated that the player and ball tracking, together with the model's temporal context, already captured most of the possession information contributed by the Smart Tags. We therefore retained the simpler tracking-only pipeline: it avoids an additional annotation-alignment step and makes fewer assumptions about the temporal precision of tactical intervals. This decision was based on the limited change to the prediction sequence and the redundancy of the added evidence.
 
 ### 4.4 Final Evaluation on Metrica
 

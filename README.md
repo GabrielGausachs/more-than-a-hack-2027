@@ -22,8 +22,8 @@ On the provided five-minute public diagnostic window, the final model achieves:
 |---:|---:|---:|---:|
 | **0.6857** | **0.7429** | **0.8824** | **0.8945** |
 
-The public window is used only to check the finished pipeline. It was not used for training,
-parameter tuning, or model selection.
+The public window is used only for diagnostic reporting after the pipeline is fixed. It was not
+used for training, parameter tuning, decoder selection, or model selection.
 
 This README describes the approach, label and feature construction, pipeline, evaluation results,
 data setup, training, inference, and submission commands.
@@ -48,8 +48,9 @@ prediction pipeline.
 
 ### How we created the training labels
 
-Training uses all 20 matches in
-[SkillCorner Open Data](https://github.com/SkillCorner/opendata).
+Development experiments use a fixed split of 16 training matches and 4 validation matches from
+[SkillCorner Open Data](https://github.com/SkillCorner/opendata). Once the model design and training
+duration are fixed, the final model is refitted on all 20 matches.
 
 SkillCorner does not provide a ready-made Home/Away/Dead-ball label for every tracking frame. It
 does, however, provide two useful sources of information:
@@ -124,8 +125,9 @@ stoppage. The output is a probability for H, A, and D at every in-period frame.
 Choosing the most likely class independently on every frame would create many one- or two-frame
 changes and fragment otherwise continuous possessions. The Viterbi decoder finds the complete
 H/A/D sequence that best balances the model probabilities with a fixed cost for changing state.
-The selected switch penalty is `1.5` (with probability epsilon `1e-8`): it discourages unlikely
-flickering without preventing a well-supported turnover or restart. Each half is decoded
+The switch penalty of `1.5` was selected in earlier experiments using SkillCorner validation and
+was not tuned on Metrica ground truth. Together with a probability epsilon of `1e-8`, it discourages
+unlikely flickering without preventing a well-supported turnover or restart. Each half is decoded
 independently, so model context and decoding never cross halftime.
 
 ## Pipeline description

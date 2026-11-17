@@ -1,6 +1,6 @@
 {
   "model_dir": "artifacts/final_model",
-  "output_dir": "outputs/final_model/submission",
+  "output_dir": "artifacts/final_model",
   "game": "BAR-ATH",
   "archive": "data/derived/feature_extracted/metrica/BAR-ATH_tactical.npz",
   "target_rate_hz": 10.0,

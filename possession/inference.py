@@ -184,7 +184,9 @@ def _possession_count(labels: np.ndarray, blocks: np.ndarray) -> int:
 
 
 def generate_submission(config_path: Path = DEFAULT_CONFIG,
-                        model_dir: Optional[Path] = None) -> Path:
+                        model_dir: Optional[Path] = None,
+                        output_dir: Optional[Path] = None,
+                        submission_name: Optional[str] = None) -> Path:
     """Generate a full-timeline submission without reading ground truth."""
 
     config = load_json(config_path)
@@ -193,7 +195,8 @@ def generate_submission(config_path: Path = DEFAULT_CONFIG,
         raise ValueError("unknown game {!r}".format(game))
     model_dir = resolve_path(str(
         model_dir if model_dir is not None else config["model_dir"]))
-    submission_dir = resolve_path(str(config["output_dir"]))
+    submission_dir = resolve_path(str(
+        output_dir if output_dir is not None else config["output_dir"]))
     archive_path = resolve_path(str(config["archive"]))
     target_rate = float(config["target_rate_hz"])
     n_frames = int(GAMES[game]["n_video_frames"])
@@ -221,10 +224,11 @@ def generate_submission(config_path: Path = DEFAULT_CONFIG,
     if not np.all(np.isin(labels[graded_mask], LABELS)):
         raise AssertionError("official half blocks must contain H/A/D")
 
-    submission_path = submission_dir / str(config["submission_name"])
+    submission_path = submission_dir / str(
+        submission_name if submission_name is not None else config["submission_name"])
     _write_submission(submission_path, labels)
     statistics = {
-        "solution": submission_dir.parent.name,
+        "solution": submission_dir.name,
         "game": game,
         "source_frames": n_frames,
         "source_rate_hz": float(GAMES[game]["fps"]),
@@ -253,8 +257,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--submission-name")
     args = parser.parse_args(argv)
-    generate_submission(args.config, args.model_dir)
+    generate_submission(
+        args.config, args.model_dir, args.output_dir, args.submission_name)
     return 0
 
 

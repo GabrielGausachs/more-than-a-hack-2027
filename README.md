@@ -245,11 +245,14 @@ history, and decoder definition to `outputs/final_model/training/`.
 ### 5. Run inference with the newly trained model
 
 ```powershell
-python -m possession.inference --model-dir outputs/final_model/training
+python -m possession.inference `
+  --model-dir outputs/final_model/training `
+  --output-dir outputs/final_model `
+  --submission-name metrica_possession.csv
 ```
 
 This explicitly loads the model, normalization and decoder produced by the new training run. It
-writes the submission to `outputs/final_model/submission/metrica_possession.csv`.
+writes the submission to `outputs/final_model/metrica_possession.csv`.
 
 ### 6. Run inference with the saved model
 
@@ -258,26 +261,26 @@ submitted CSV without retraining, only the Metrica feature archive is required:
 
 ```powershell
 python -m possession.preprocessing.feature_extraction metrica
-python -m possession.inference
+python -m possession.inference --submission-name metrica_possession.csv
 ```
 
 Without `--model-dir`, inference uses `artifacts/final_model/`, as specified in
-`configs/inference.json`. This is the frozen model included with the repository. Both inference
-commands write to the same submission path, so running one after the other replaces the previous
-CSV; the difference is only which model artifacts are used to produce it.
+`configs/inference.json`. This is the frozen model included with the repository, and its prediction
+is written alongside it. The `--submission-name` argument can be changed to any desired CSV
+filename.
 
 The expected output is:
 
 ```text
-outputs/final_model/submission/metrica_possession.csv
+artifacts/final_model/metrica_possession.csv
 ```
 
 ### 7. Validate and evaluate the submission
 
-Always validate the exact file that will be submitted:
+Before running the public diagnostic evaluation, validate the exact file with this command:
 
 ```powershell
-python evaluation/validate_submission.py outputs/final_model/submission/metrica_possession.csv
+python evaluation/validate_submission.py artifacts/final_model/metrica_possession.csv
 ```
 
 The validator checks the exact `frame,label` header, all 199,319 ordered frame indices, and the
@@ -287,15 +290,8 @@ The public diagnostic evaluation is run with the official evaluator:
 
 ```powershell
 python evaluation/run_evaluation.py --gt public `
-  --results outputs/final_model/submission `
-  --out outputs/final_model/submission/evaluation
-```
-
-An optional horizontal comparison of predictions and public ground truth can be generated with:
-
-```powershell
-python -m possession.plot_timeline --gt public `
-  --submission outputs/final_model/submission/metrica_possession.csv
+  --results artifacts/final_model `
+  --out artifacts/final_model/evaluation
 ```
 
 ## Repository layout
@@ -310,7 +306,6 @@ possession/
 |-- modeling/                data preparation, Deep Sets-TCN and training
 |-- decoding.py              period-aware Viterbi decoder
 |-- inference.py             Metrica inference and submission generation
-`-- plot_timeline.py         optional public diagnostic plot
 starter/                     original competition examples and utilities
 setup_data.py                Metrica tactical/broadcast data installer
 requirements.txt             pinned Python dependencies
